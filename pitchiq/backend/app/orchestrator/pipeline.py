@@ -26,9 +26,9 @@ from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agents.critic import run_critic
 from app.config import settings
 from app.gateway import cache as semantic_cache
-from app.gateway.critic import run_critic
 from app.gateway.proxy import call_llm
 from app.gateway.router import route
 from app.services.token_tracker import record_usage
@@ -141,8 +141,8 @@ async def _run_free_pipeline(
     critic_result = await run_critic(prompt, llm_response.text)
     critic_cost = await record_usage(
         model_used=settings.GROQ_CHEAP_MODEL,
-        input_tokens=critic_result.raw_response.input_tokens,
-        output_tokens=critic_result.raw_response.output_tokens,
+        input_tokens=critic_result.input_tokens,
+        output_tokens=critic_result.output_tokens,
         db=db,
         user_id=user_id,
         task_id=task_id,
@@ -201,8 +201,8 @@ async def _run_premium_pipeline(
         critic_result = await run_critic(prompt, llm_response.text)
         critic_cost = await record_usage(
             model_used=settings.GROQ_CHEAP_MODEL,
-            input_tokens=critic_result.raw_response.input_tokens,
-            output_tokens=critic_result.raw_response.output_tokens,
+            input_tokens=critic_result.input_tokens,
+            output_tokens=critic_result.output_tokens,
             db=db,
             user_id=user_id,
             task_id=task_id,
