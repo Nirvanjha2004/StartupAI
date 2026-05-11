@@ -46,6 +46,8 @@ class ChatRequest(BaseModel):
 
 
 class ChatResponse(BaseModel):
+    model_config = {"protected_namespaces": ()}
+
     response: str
     model_used: str
     quality_score: float

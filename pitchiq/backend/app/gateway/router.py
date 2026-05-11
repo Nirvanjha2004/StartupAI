@@ -20,15 +20,15 @@ def route(user_tier: Literal["free", "premium"]) -> RouteDecision:
     """
     Return the inference strategy and model for the given user tier.
 
-    FREE    → single_pass  with groq/llama-3.1-8b-instant
-    PREMIUM → iterative    with claude-sonnet-4-20250514
+    FREE    → single_pass  with GROQ_CHEAP_MODEL
+    PREMIUM → iterative    with PREMIUM_MODEL
+              (currently also Groq; swap config.PREMIUM_MODEL to Claude when ready)
     """
     if user_tier == "premium":
         return RouteDecision(
             strategy="iterative",
-            model=settings.CLAUDE_QUALITY_MODEL,
+            model=settings.PREMIUM_MODEL,
         )
-    # Default: free tier
     return RouteDecision(
         strategy="single_pass",
         model=settings.GROQ_CHEAP_MODEL,

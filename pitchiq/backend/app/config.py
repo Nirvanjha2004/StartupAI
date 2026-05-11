@@ -33,8 +33,11 @@ class Settings(BaseSettings):
     CACHE_SIMILARITY_THRESHOLD: float = 0.92
 
     # Model identifiers
+    # Both tiers use Groq for now. To enable Claude for premium,
+    # change PREMIUM_MODEL to "claude-sonnet-4-20250514".
     GROQ_CHEAP_MODEL: str = "llama-3.1-8b-instant"
     CLAUDE_QUALITY_MODEL: str = "claude-sonnet-4-20250514"
+    PREMIUM_MODEL: str = "llama-3.1-8b-instant"
 
     # Iterative refinement
     MAX_CRITIC_ITERATIONS: int = 5

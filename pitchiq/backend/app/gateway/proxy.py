@@ -100,7 +100,7 @@ async def _call_anthropic(model: str, messages: list[dict]) -> NormalizedRespons
 
 async def _call_groq(model: str, messages: list[dict]) -> NormalizedResponse:
     clean_model = _strip_groq_prefix(model)
-    client = AsyncGroq(api_key=settings.GROQ_API_KEY)
+    client = AsyncGroq(api_key=settings.GROQ_API_KEY, timeout=120.0)
     response = await client.chat.completions.create(
         model=clean_model,
         messages=messages,
@@ -148,7 +148,7 @@ async def _stream_anthropic(model: str, messages: list[dict]) -> AsyncGenerator[
 
 async def _stream_groq(model: str, messages: list[dict]) -> AsyncGenerator[str, None]:
     clean_model = _strip_groq_prefix(model)
-    client = AsyncGroq(api_key=settings.GROQ_API_KEY)
+    client = AsyncGroq(api_key=settings.GROQ_API_KEY, timeout=120.0)
     stream = await client.chat.completions.create(
         model=clean_model,
         messages=messages,

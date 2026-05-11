@@ -9,6 +9,7 @@ Endpoint: https://api.jina.ai/v1/embeddings
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from typing import Optional
 
@@ -33,6 +34,7 @@ async def _embed(text_input: str, task: str) -> list[float]:
     """
     Call the Jina AI embeddings API and return a 1024-dim vector.
     Raises httpx.HTTPError on failure — callers should catch and handle.
+    Retries once on connection/DNS errors.
     """
     headers = {
         "Content-Type": "application/json",
@@ -44,10 +46,20 @@ async def _embed(text_input: str, task: str) -> list[float]:
         "dimensions": _JINA_DIMENSIONS,
         "task": task,
     }
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.post(_JINA_ENDPOINT, headers=headers, json=payload)
-        response.raise_for_status()
-        return response.json()["data"][0]["embedding"]
+    last_exc = None
+    for attempt in range(2):  # 1 retry on transient DNS/connection errors
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                response = await client.post(_JINA_ENDPOINT, headers=headers, json=payload)
+                response.raise_for_status()
+                return response.json()["data"][0]["embedding"]
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            last_exc = exc
+            logger.warning("Jina embed attempt %d failed (%s), retrying...", attempt + 1, exc)
+            await asyncio.sleep(1.0)
+        except Exception as exc:
+            raise
+    raise last_exc
 
 
 class CacheResult:

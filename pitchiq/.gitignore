@@ -1,0 +1,62 @@
+# ── Environment & secrets ─────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+!backend/.env.example
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.Python
+pip-wheel-metadata/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Testing & coverage ────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+
+# ── Alembic ───────────────────────────────────────────────────────────────────
+# Keep migrations, ignore generated temp files
+*.pyc
+
+# ── Docker ────────────────────────────────────────────────────────────────────
+# Don't ignore docker-compose.yml — it's needed
+*.log
+
+# ── Node / Frontend ───────────────────────────────────────────────────────────
+node_modules/
+.next/
+.nuxt/
+out/
+dist/
+.cache/
+*.tsbuildinfo
+
+# ── IDEs ──────────────────────────────────────────────────────────────────────
+.vscode/settings.json
+.vscode/launch.json
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+*.bak
+*.tmp
