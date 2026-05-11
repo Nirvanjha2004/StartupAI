@@ -1,84 +1,49 @@
-"""Backend API client"""
+import type { TaskRequest, TaskResponse } from '@/types'
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api';
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
-export interface TaskRequest {
-  company: string;
-  contact_name: string;
-  context?: string;
-  tone?: string;
-}
-
-export interface TaskResponse {
-  task_id: string;
-  status: string;
-  created_at: string;
-}
-
-export async function submitTask(data: TaskRequest): Promise<TaskResponse> {
-  const response = await fetch(`${API_BASE_URL}/tasks/run`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(data),
-  });
-
-  if (!response.ok) {
-    throw new Error('Failed to submit task');
+/**
+ * Run a full agent task. Waits for completion (backend is synchronous).
+ * Timeout: 300s — agent pipeline can take a few minutes.
+ */
+export async function runTask(task: string, tier: string): Promise<TaskResponse> {
+  const body: TaskRequest = {
+    task,
+    user_tier: tier as 'free' | 'premium',
   }
 
-  return response.json();
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 300_000)
+
+  try {
+    const res = await fetch(`${API_BASE}/api/v1/task`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    })
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: res.statusText }))
+      throw new Error(err.detail || `Request failed: ${res.status}`)
+    }
+
+    return res.json()
+  } finally {
+    clearTimeout(timeout)
+  }
 }
 
-export async function getTaskResult(taskId: string) {
-  const response = await fetch(`${API_BASE_URL}/tasks/task/${taskId}`);
+/**
+ * Poll task status by ID.
+ */
+export async function getTask(taskId: string): Promise<TaskResponse> {
+  const res = await fetch(`${API_BASE}/api/v1/task/${taskId}`)
 
-  if (!response.ok) {
-    throw new Error('Failed to fetch task result');
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }))
+    throw new Error(err.detail || `Request failed: ${res.status}`)
   }
 
-  return response.json();
-}
-
-export async function listTasks(userId: string) {
-  const response = await fetch(`${API_BASE_URL}/tasks/tasks?user_id=${userId}`);
-
-  if (!response.ok) {
-    throw new Error('Failed to fetch tasks');
-  }
-
-  return response.json();
-}
-
-export async function login(email: string, password: string) {
-  const response = await fetch(`${API_BASE_URL}/auth/login`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ email, password }),
-  });
-
-  if (!response.ok) {
-    throw new Error('Failed to login');
-  }
-
-  return response.json();
-}
-
-export async function register(email: string, password: string) {
-  const response = await fetch(`${API_BASE_URL}/auth/register`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ email, password }),
-  });
-
-  if (!response.ok) {
-    throw new Error('Failed to register');
-  }
-
-  return response.json();
+  return res.json()
 }
