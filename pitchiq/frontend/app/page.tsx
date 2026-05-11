@@ -1,6 +1,7 @@
 'use client'
 
 import { useState } from 'react'
+import Link from 'next/link'
 import TaskForm from '@/components/TaskForm'
 import AgentTimeline from '@/components/AgentTimeline'
 import EmailCard from '@/components/EmailCard'
@@ -33,8 +34,14 @@ export default function Home() {
   return (
     <div className="min-h-screen bg-[#0f0f0f] flex flex-col">
       {/* Header */}
-      <header className="px-6 py-5 border-b border-[#1a1a1a]">
+      <header className="px-6 py-5 border-b border-[#1a1a1a] flex items-center justify-between">
         <span className="text-white font-semibold text-lg tracking-tight">PitchIQ</span>
+        <Link
+          href="/dashboard"
+          className="text-[#555] hover:text-[#999] text-sm transition-colors"
+        >
+          Dashboard →
+        </Link>
       </header>
 
       <main className="flex-1 w-full max-w-3xl mx-auto px-4 py-12 space-y-10">
