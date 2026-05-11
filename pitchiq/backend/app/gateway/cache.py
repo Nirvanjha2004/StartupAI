@@ -25,9 +25,9 @@ logger = get_logger("cache")
 _JINA_ENDPOINT = "https://api.jina.ai/v1/embeddings"
 _JINA_MODEL = "jina-embeddings-v3"
 _JINA_DIMENSIONS = 1024
-# task=retrieval.query for lookups, retrieval.passage for storing
-_TASK_QUERY = "retrieval.query"
-_TASK_PASSAGE = "retrieval.passage"
+# text-matching is the correct task for semantic cache (same text → same space)
+# retrieval.query/passage are asymmetric and break same-prompt lookups
+_TASK_CACHE = "text-matching"
 
 
 async def _embed(text_input: str, task: str) -> list[float]:
@@ -80,7 +80,7 @@ async def cache_get(prompt: str, db: AsyncSession) -> Optional[CacheResult]:
         return None
 
     try:
-        embedding = await _embed(prompt, task=_TASK_QUERY)
+        embedding = await _embed(prompt, task=_TASK_CACHE)
         embedding_str = "[" + ",".join(str(v) for v in embedding) + "]"
 
         # pgvector cosine distance = 1 - cosine_similarity
@@ -131,7 +131,7 @@ async def cache_set(
         return
 
     try:
-        embedding = await _embed(prompt, task=_TASK_PASSAGE)
+        embedding = await _embed(prompt, task=_TASK_CACHE)
         embedding_str = "[" + ",".join(str(v) for v in embedding) + "]"
 
         await db.execute(

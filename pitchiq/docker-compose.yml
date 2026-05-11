@@ -55,6 +55,8 @@ services:
       - 8.8.8.8
       - 1.1.1.1
       - 8.8.4.4
+    extra_hosts:
+      - "api.jina.ai:104.26.10.242"
 
 volumes:
   postgres_data:
