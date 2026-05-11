@@ -47,17 +47,17 @@ async def _embed(text_input: str, task: str) -> list[float]:
         "task": task,
     }
     last_exc = None
-    for attempt in range(2):  # 1 retry on transient DNS/connection errors
+    for attempt in range(2):  # 1 retry on transient connection/timeout errors
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
+            async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.post(_JINA_ENDPOINT, headers=headers, json=payload)
                 response.raise_for_status()
                 return response.json()["data"][0]["embedding"]
-        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.TimeoutException) as exc:
             last_exc = exc
             logger.warning("Jina embed attempt %d failed (%s), retrying...", attempt + 1, exc)
             await asyncio.sleep(1.0)
-        except Exception as exc:
+        except Exception:
             raise
     raise last_exc
 
