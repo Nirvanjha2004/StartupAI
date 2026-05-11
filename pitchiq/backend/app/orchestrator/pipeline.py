@@ -93,8 +93,10 @@ async def run_inference(
 
     # ── 2. LLM call + critic loop ────────────────────────────────────────────
     if strategy == "single_pass":
+        # FREE tier: exactly 1 iteration, no critic loop
         result = await _run_free_pipeline(prompt, messages, model, db, user_id, task_id)
     else:
+        # PREMIUM tier: up to MAX_CRITIC_ITERATIONS (5), exits early on score >= 8.5
         result = await _run_premium_pipeline(prompt, messages, model, db, user_id, task_id)
 
     # ── 3. Store in cache ────────────────────────────────────────────────────
@@ -190,7 +192,7 @@ async def _run_premium_pipeline(
     iteration = 0
     note: Optional[str] = None
 
-    for iteration in range(1, settings.MAX_CRITIC_ITERATIONS + 1):
+    for iteration in range(1, settings.MAX_CRITIC_ITERATIONS + 1):  # max 5 for premium
         # LLM call — fallback if primary fails
         try:
             llm_response = await call_llm(model=model, messages=current_messages)
@@ -333,10 +335,15 @@ class AgentPipeline:
         Returns final_output dict.
         """
         start_time = time.monotonic()
+        from datetime import datetime, timezone
+        task_start_dt = datetime.now(timezone.utc)
 
         # 1. Create task in DB
         task_id = await self.state.create_task(task, user_tier, db, user_id)
         logger.info("AgentPipeline starting task %s", task_id)
+
+        # Track agent instances so we can read their accumulated costs
+        agent_instances: Dict[str, Any] = {}
 
         try:
             # 2. Plan
@@ -359,21 +366,27 @@ class AgentPipeline:
                 instruction = str(agent_instructions.get(agent_name, task))
                 context = await self.state.get_context(task_id, db)
 
-                logger.info("[pipeline] Running agent: %s", agent_name)
-                agent = self._agent_registry[agent_name](tier=user_tier)
+                # Tier routing:
+                # - writer gets the user's actual tier (cascading on premium)
+                # - all other agents always use free (single-pass, fast)
+                agent_tier = user_tier if agent_name == "writer" else "free"
+
+                logger.info("[pipeline] Running agent: %s (tier=%s)", agent_name, agent_tier)
+                agent = self._agent_registry[agent_name](tier=agent_tier)
+                agent_instances[agent_name] = agent
 
                 try:
                     output = await agent.execute(instruction, context)
                     await self.state.save_agent_output(task_id, agent_name, output, db)
-                    logger.info("[pipeline] Agent %s completed", agent_name)
+                    logger.info("[pipeline] Agent %s completed (cost=$%.5f)", agent_name, agent.total_cost)
                 except Exception as exc:
                     error_msg = f"Agent '{agent_name}' failed: {exc}"
                     logger.error("[pipeline] %s", error_msg)
                     await self.state.fail_task(task_id, error_msg, db)
                     raise RuntimeError(error_msg) from exc
 
-            # 4. Always run critic last
-            logger.info("[pipeline] Running critic...")
+            # 4. Always run critic last — always free tier (evaluation, not generation)
+            logger.info("[pipeline] Running critic (tier=free)...")
             final_context = await self.state.get_context(task_id, db)
             try:
                 critic_output = await self._critic.execute(task, final_context)
@@ -389,6 +402,30 @@ class AgentPipeline:
             # 5. Compile final output
             execution_time_ms = int((time.monotonic() - start_time) * 1000)
             final_context = await self.state.get_context(task_id, db)
+
+            # Sum costs from agent gateway responses — agents track this via _total_cost
+            # (token_usage.task_id is NULL because gateway calls don't carry task_id)
+            actual_cost = (
+                self._planner.total_cost
+                + self._critic.total_cost
+                + sum(
+                    agent_instances[a].total_cost
+                    for a in agents_required
+                    if a in agent_instances
+                )
+            )
+            # token counts: sum from token_usage by time window (best-effort)
+            from sqlalchemy import text as sa_text
+            token_result = await db.execute(
+                sa_text(
+                    "SELECT COALESCE(SUM(input_tokens + output_tokens), 0) "
+                    "FROM token_usage "
+                    "WHERE created_at >= :since"
+                ),
+                {"since": task_start_dt},
+            )
+            actual_tokens = int(token_result.scalar() or 0)
+
             final_output = self._compile_output(
                 task=task,
                 plan=plan,
@@ -396,22 +433,16 @@ class AgentPipeline:
                 critic_output=critic_output,
                 agents_used=agents_required,
                 execution_time_ms=execution_time_ms,
-                planner_cost=self._planner.total_cost,
+                total_cost=actual_cost,
+                total_tokens=actual_tokens,
             )
 
             # 6. Complete task
-            total_cost = sum(
-                self._agent_registry[a](tier=user_tier).total_cost
-                for a in agents_required
-                if a in self._agent_registry
-            )
-            total_cost += self._planner.total_cost + self._critic.total_cost
-
             await self.state.complete_task(
                 task_id=task_id,
                 final_output=final_output,
-                total_cost_usd=final_output["total_cost_usd"],
-                total_tokens=0,
+                total_cost_usd=actual_cost,
+                total_tokens=actual_tokens,
                 db=db,
             )
 
@@ -434,19 +465,15 @@ class AgentPipeline:
         critic_output: Dict[str, Any],
         agents_used: List[str],
         execution_time_ms: int,
-        planner_cost: float,
+        total_cost: float,
+        total_tokens: int,
     ) -> Dict[str, Any]:
         """Compile all agent outputs into final response."""
-        # Collect emails from writer
         writer_output = context.get("writer", {})
         emails = writer_output.get("emails", [])
 
-        # Count companies researched
         researcher_output = context.get("researcher", {})
         companies_researched = len(researcher_output.get("companies", []))
-
-        # Estimate total cost (gateway tracks actual costs in token_usage)
-        total_cost = planner_cost
 
         return {
             "task": task,
@@ -456,7 +483,7 @@ class AgentPipeline:
             "critic_score": critic_output.get("overall_score", 0.0),
             "critic_feedback": critic_output.get("feedback", ""),
             "total_cost_usd": round(total_cost, 6),
-            "total_tokens": 0,  # Tracked in token_usage table
+            "total_tokens": total_tokens,
             "agents_used": ["planner"] + agents_used + ["critic"],
             "execution_time_ms": execution_time_ms,
         }

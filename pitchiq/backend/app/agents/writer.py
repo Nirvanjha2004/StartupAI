@@ -1,14 +1,18 @@
 """
 Writer Agent — generates personalized cold outreach emails.
 
-Takes enriched company data from shared state.
-Uses PREMIUM tier gateway (quality matters here).
-Generates one email per company referencing specific context.
+Tier routing:
+- free user  → tier="free"  → single-pass Groq
+- premium user → tier="premium" → cascading: starts with Groq,
+  upgrades iterations until score >= 8.5 or max 5 rounds
+
+All other agents always use free tier regardless of user tier.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Dict, List
 
 from app.agents.base import BaseAgent
@@ -16,122 +20,103 @@ from app.utils.logger import get_logger
 
 logger = get_logger("writer")
 
-_WRITER_SYSTEM_PROMPT = """You are an expert cold email copywriter specializing in B2B SaaS outreach.
+_WRITER_SYSTEM_PROMPT = """You are an expert cold email copywriter specializing in B2B outreach.
 
-Write a highly personalized cold email based on the company and contact information provided.
+Write personalized cold emails for ALL companies listed. Each email must:
+- Subject: compelling, specific, under 60 characters
+- Body: 3-4 short paragraphs, under 150 words
+- Reference the company's specific context, news, or funding
+- Address the decision maker by first name (use "Founder" if unknown)
+- Clear CTA: 15-minute call
+- No generic openers like "I hope this email finds you well"
 
-Rules:
-- Subject line: compelling, specific, under 60 characters
-- Body: 3-4 short paragraphs, under 200 words total
-- Reference the company's specific problem, recent news, or funding stage
-- Address the decision maker by first name
-- Clear single call-to-action (15-minute call)
-- No generic phrases like "I hope this email finds you well"
-- Sound human, not like a template
+Return ONLY a JSON array, no preamble, no markdown:
+[
+  {
+    "company": "company name",
+    "to": "first name or Founder",
+    "subject": "subject line",
+    "body": "full email body",
+    "personalization_hooks": ["hook1", "hook2"]
+  }
+]
 
-Return ONLY this JSON, no preamble, no markdown:
-{
-  "company": "company name",
-  "to": "decision maker first name or 'Founder' if unknown",
-  "subject": "email subject line",
-  "body": "full email body",
-  "personalization_hooks": ["hook1", "hook2"]
-}"""
+One object per company. All companies must be included."""
 
 
 class WriterAgent(BaseAgent):
-    """Generates personalized cold outreach emails for each company."""
+    """Generates personalized cold outreach emails — batched into one gateway call."""
 
     def __init__(self, tier: str = "free"):
-        # Writer always uses premium — quality matters
-        super().__init__(name="writer", role="writing", tier="premium")
+        super().__init__(name="writer", role="writing", tier=tier)
 
     async def execute(self, task: str, context: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Generate personalized emails for all enriched companies.
+        Generate emails for all companies in ONE gateway call.
 
         Args:
             task:    Writer instruction from planner.
-            context: Must contain 'enricher' output with 'enriched_companies'.
-                     Falls back to 'researcher' output if enricher not run.
+            context: Must contain 'enricher' or 'researcher' output.
 
         Returns:
             Dict with 'emails' list.
         """
         logger.info("[writer] Task: %s", task[:80])
 
-        # Get enriched companies (prefer enricher output, fall back to researcher)
-        enriched_companies = self._get_companies(context)
-
-        if not enriched_companies:
+        companies = self._get_companies(context)
+        if not companies:
             logger.warning("[writer] No companies to write emails for")
             return {"emails": []}
 
-        logger.info("[writer] Writing emails for %d companies", len(enriched_companies))
+        logger.info("[writer] Writing emails for %d companies (batched)", len(companies))
 
-        emails: List[Dict[str, Any]] = []
-        for company_data in enriched_companies:
-            try:
-                email = await self._write_email(task, company_data)
-                if email:
-                    emails.append(email)
-            except Exception as exc:
-                logger.warning(
-                    "[writer] Failed to write email for %s: %s",
-                    company_data.get("company", "unknown"),
-                    exc,
-                )
+        # Build one prompt with all companies
+        companies_block = self._format_companies(companies)
+        prompt = f"""Writing instruction: {task}
 
-        logger.info("[writer] Generated %d emails", len(emails))
-        return {"emails": emails}
+Companies and contacts:
+{companies_block}
 
-    async def _write_email(
-        self, instruction: str, company_data: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Generate a single personalized email."""
-        company_name = company_data.get("company", "the company")
-        dm_name = company_data.get("decision_maker_name") or "Founder"
-        dm_role = company_data.get("decision_maker_role") or "Founder"
-        description = company_data.get("description", "")
-        funding_stage = company_data.get("funding_stage", "")
-        recent_news = company_data.get("recent_news", "")
-        context_for_email = company_data.get("context_for_email", "")
-
-        prompt = f"""Writing instruction: {instruction}
-
-Company: {company_name}
-Decision Maker: {dm_name} ({dm_role})
-What they do: {description}
-Funding stage: {funding_stage}
-Recent news: {recent_news}
-Additional context: {context_for_email}
-
-Write a personalized cold email specifically for {company_name}."""
+Write one personalized cold email for each company above."""
 
         messages = [
             {"role": "system", "content": _WRITER_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ]
 
-        gw = await self._call_gateway(
-            prompt=prompt,
-            messages=messages,
-            tier_override="premium",
-        )
+        try:
+            gw = await self._call_gateway(prompt=prompt, messages=messages)
+            emails = self._parse_emails(gw.response, companies)
+        except Exception as exc:
+            logger.warning("[writer] Batch gateway call failed: %s", exc)
+            emails = []
 
-        email = self._parse_email(gw.response, company_name, dm_name)
-        logger.info("[writer] Email for %s: subject='%s'", company_name, email.get("subject", "")[:50])
-        return email
+        logger.info("[writer] Generated %d emails", len(emails))
+        return {"emails": emails}
+
+    def _format_companies(self, companies: List[Dict]) -> str:
+        """Format company list for the prompt."""
+        parts = []
+        for i, c in enumerate(companies, 1):
+            dm = c.get("decision_maker_name") or "Founder"
+            role = c.get("decision_maker_role") or "Founder"
+            parts.append(
+                f"{i}. {c.get('company', 'Unknown')}\n"
+                f"   Contact: {dm} ({role})\n"
+                f"   About: {c.get('description', 'N/A')}\n"
+                f"   Funding: {c.get('funding_stage', 'unknown')}\n"
+                f"   News: {c.get('recent_news') or 'N/A'}\n"
+                f"   Context: {c.get('context_for_email') or 'N/A'}"
+            )
+        return "\n\n".join(parts)
 
     def _get_companies(self, context: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Get companies from context — prefer enricher, fall back to researcher."""
-        # Try enricher output first
+        """Get companies — prefer enricher output, fall back to researcher."""
         enricher_output = context.get("enricher", {})
         enriched = enricher_output.get("enriched_companies", [])
         if enriched:
             return enriched
 
-        # Fall back to researcher output (no decision maker info)
         researcher_output = context.get("researcher", {})
         companies = researcher_output.get("companies", [])
         if companies:
@@ -145,67 +130,63 @@ Write a personalized cold email specifically for {company_name}."""
                     "website": c.get("website"),
                     "decision_maker_name": None,
                     "decision_maker_role": None,
-                    "linkedin_url": None,
                     "context_for_email": "",
                 }
                 for c in companies
             ]
-
         return []
 
-    def _parse_email(
-        self, raw: str, company_name: str, dm_name: str
-    ) -> Dict[str, Any]:
-        """Parse email JSON with robust fallback for control characters."""
-        import re
-
+    def _parse_emails(
+        self, raw: str, companies: List[Dict]
+    ) -> List[Dict[str, Any]]:
+        """Parse JSON — handles array, single object, or array of objects."""
         text = raw.strip()
         if text.startswith("```"):
             lines = text.split("\n")
             text = "\n".join(lines[1:-1]) if len(lines) > 2 else text
 
-        # Try strict parse first
+        def extract_emails(data: Any) -> List[Dict]:
+            """Normalize any parsed structure into a list of email dicts."""
+            if isinstance(data, list):
+                return [e for e in data if isinstance(e, dict) and "body" in e]
+            if isinstance(data, dict) and "body" in data:
+                return [data]  # single object — wrap in list
+            return []
+
+        # Try strict parse
         try:
             data = json.loads(text)
-            if "body" not in data:
-                raise ValueError("Missing 'body' key")
-            return data
+            result = extract_emails(data)
+            if result:
+                return result
         except (json.JSONDecodeError, ValueError):
             pass
 
-        # Try cleaning control characters and re-parsing
+        # Try cleaning control characters
         try:
-            # Replace unescaped control characters inside JSON strings
             cleaned = re.sub(r'[\x00-\x1f\x7f]', lambda m: repr(m.group())[1:-1], text)
             data = json.loads(cleaned)
-            if "body" in data:
-                return data
+            result = extract_emails(data)
+            if result:
+                return result
         except (json.JSONDecodeError, ValueError):
             pass
 
-        # Extract fields with regex as last resort
+        # Last resort: extract all JSON objects from the text
         try:
-            subject_match = re.search(r'"subject"\s*:\s*"([^"]+)"', text)
-            body_match = re.search(r'"body"\s*:\s*"(.*?)"(?:\s*,|\s*\})', text, re.DOTALL)
-            to_match = re.search(r'"to"\s*:\s*"([^"]+)"', text)
-
-            if body_match:
-                return {
-                    "company": company_name,
-                    "to": to_match.group(1) if to_match else dm_name,
-                    "subject": subject_match.group(1) if subject_match else f"Quick question about {company_name}",
-                    "body": body_match.group(1).replace("\\n", "\n"),
-                    "personalization_hooks": [],
-                }
+            objects = re.findall(r'\{[^{}]*"body"[^{}]*\}', text, re.DOTALL)
+            emails = []
+            for obj in objects:
+                try:
+                    e = json.loads(obj)
+                    if "body" in e:
+                        emails.append(e)
+                except Exception:
+                    pass
+            if emails:
+                return emails
         except Exception:
             pass
 
-        # Final fallback — use raw text as body
-        logger.warning("[writer] All JSON parse attempts failed for %s, using raw text", company_name)
-        return {
-            "company": company_name,
-            "to": dm_name,
-            "subject": f"Quick question about {company_name}",
-            "body": raw[:2000],
-            "personalization_hooks": [],
-        }
+        logger.warning("[writer] Could not parse email JSON, returning empty")
+        return []

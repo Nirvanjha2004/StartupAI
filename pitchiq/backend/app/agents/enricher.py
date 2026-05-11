@@ -1,10 +1,9 @@
 """
 Enricher Agent — finds decision maker info for each company.
 
-Takes companies list from researcher output.
-For each company: searches for founder/CTO/VP Eng.
-Uses FREE tier gateway.
-If enrichment fails for a company → skip it, log warning, continue.
+Batches all companies into ONE Tavily search + ONE gateway call
+instead of N calls (one per company). This cuts enricher time from
+N×20s to ~40s total regardless of company count.
 """
 
 from __future__ import annotations
@@ -18,28 +17,30 @@ from app.utils.logger import get_logger
 
 logger = get_logger("enricher")
 
-_ENRICHER_PROMPT = """You are a contact enrichment specialist. Given search results about a company's leadership, extract decision maker information.
+_ENRICHER_PROMPT = """You are a contact enrichment specialist. Given search results about multiple companies' leadership, extract decision maker information for each company.
 
-Return ONLY this JSON, no preamble, no markdown:
-{
-  "decision_maker_name": "full name or null",
-  "decision_maker_role": "founder/CEO/CTO/VP Engineering/etc or null",
-  "linkedin_url": "LinkedIn profile URL or null",
-  "context_for_email": "1-2 sentences about this person relevant for cold outreach"
-}
+Return ONLY a JSON array, no preamble, no markdown:
+[
+  {
+    "company": "exact company name",
+    "decision_maker_name": "full name or null",
+    "decision_maker_role": "founder/CEO/CTO/etc or null",
+    "linkedin_url": "LinkedIn URL or null",
+    "context_for_email": "1 sentence about this person relevant for cold outreach"
+  }
+]
 
-If no clear decision maker found, return all fields as null."""
+Include one entry per company. If no decision maker found for a company, use null for those fields."""
 
 
 class EnricherAgent(BaseAgent):
-    """Finds decision maker names and contact info for companies."""
+    """Finds decision maker names and contact info for companies — batched."""
 
     def __init__(self, tier: str = "free"):
         super().__init__(name="enricher", role="enrichment", tier="free")
         self._tavily = None
 
     def _get_tavily(self):
-        """Lazy-load Tavily client."""
         if self._tavily is None:
             from tavily import TavilyClient
             self._tavily = TavilyClient(api_key=settings.TAVILY_API_KEY)
@@ -47,7 +48,7 @@ class EnricherAgent(BaseAgent):
 
     async def execute(self, task: str, context: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Enrich companies with decision maker info.
+        Enrich all companies in one batched gateway call.
 
         Args:
             task:    Enricher instruction from planner.
@@ -58,7 +59,6 @@ class EnricherAgent(BaseAgent):
         """
         logger.info("[enricher] Task: %s", task[:80])
 
-        # Get companies from researcher output
         researcher_output = context.get("researcher", {})
         companies = researcher_output.get("companies", [])
 
@@ -66,111 +66,109 @@ class EnricherAgent(BaseAgent):
             logger.warning("[enricher] No companies to enrich")
             return {"enriched_companies": []}
 
-        logger.info("[enricher] Enriching %d companies", len(companies))
+        logger.info("[enricher] Enriching %d companies (batched)", len(companies))
 
-        enriched: List[Dict[str, Any]] = []
+        # ── Step 1: One Tavily search per company (fast, parallel-ish) ──────
+        all_snippets: List[str] = []
         for company in companies:
+            name = company.get("name", "")
+            if not name:
+                continue
+            query = f"{name} founder CEO LinkedIn"
             try:
-                enriched_data = await self._enrich_company(company)
-                if enriched_data:
-                    enriched.append(enriched_data)
+                results = self._get_tavily().search(query, max_results=3)
+                for r in results.get("results", []):
+                    snippet = f"[{name}] {r.get('title','')} — {r.get('content','')[:150]}"
+                    all_snippets.append(snippet)
             except Exception as exc:
-                logger.warning(
-                    "[enricher] Failed to enrich %s: %s",
-                    company.get("name", "unknown"),
-                    exc,
-                )
-                # Continue with other companies
+                logger.warning("[enricher] Search failed for %s: %s", name, exc)
 
-        logger.info("[enricher] Successfully enriched %d/%d companies", len(enriched), len(companies))
-        return {"enriched_companies": enriched}
+        if not all_snippets:
+            logger.warning("[enricher] No search results, returning companies without enrichment")
+            return {
+                "enriched_companies": [
+                    self._empty_enriched(c) for c in companies
+                ]
+            }
 
-    async def _enrich_company(self, company: Dict[str, Any]) -> Dict[str, Any]:
-        """Enrich a single company with decision maker info."""
-        company_name = company.get("name", "")
-        if not company_name:
-            return {}
+        # ── Step 2: ONE gateway call to extract all decision makers ──────────
+        company_names = [c.get("name", "") for c in companies if c.get("name")]
+        combined = "\n\n".join(all_snippets[:20])  # cap tokens
 
-        # Search for founder/CEO
-        query = f"{company_name} founder CEO LinkedIn"
-        logger.info("[enricher] Searching: %s", query[:60])
+        prompt = (
+            f"Companies to enrich: {', '.join(company_names)}\n\n"
+            f"Search results:\n{combined}\n\n"
+            f"Extract decision maker info for each company listed above."
+        )
+
+        messages = [
+            {"role": "system", "content": _ENRICHER_PROMPT},
+            {"role": "user", "content": prompt},
+        ]
 
         try:
-            results = self._get_tavily().search(query, max_results=5)
-            search_snippets = []
-            for r in results.get("results", []):
-                snippet = f"[{r.get('title', '')}] {r.get('content', '')[:200]}"
-                search_snippets.append(snippet)
-
-            if not search_snippets:
-                logger.warning("[enricher] No results for %s", company_name)
-                return self._build_enriched_company(company, None)
-
-            # Extract decision maker with gateway
-            combined = "\n\n".join(search_snippets)
-            prompt = f"""Company: {company_name}
-
-Search results about leadership:
-{combined}
-
-Extract decision maker information."""
-
-            messages = [
-                {"role": "system", "content": _ENRICHER_PROMPT},
-                {"role": "user", "content": prompt},
-            ]
-
             gw = await self._call_gateway(prompt=prompt, messages=messages)
-            decision_maker = self._parse_decision_maker(gw.response)
-
-            return self._build_enriched_company(company, decision_maker)
-
+            dm_list = self._parse_batch(gw.response, companies)
         except Exception as exc:
-            logger.warning("[enricher] Search/extraction failed for %s: %s", company_name, exc)
-            return self._build_enriched_company(company, None)
+            logger.warning("[enricher] Batch gateway call failed: %s", exc)
+            dm_list = [self._empty_enriched(c) for c in companies]
 
-    def _parse_decision_maker(self, raw: str) -> Dict[str, Any]:
-        """Parse decision maker JSON with fallback."""
+        # ── Step 3: Merge with researcher company data ────────────────────────
+        dm_map = {item["company"].lower(): item for item in dm_list}
+        enriched: List[Dict[str, Any]] = []
+
+        for company in companies:
+            name = company.get("name", "")
+            dm = dm_map.get(name.lower(), {})
+            enriched.append({
+                "company": name,
+                "description": company.get("description", ""),
+                "funding_stage": company.get("funding_stage", "unknown"),
+                "recent_news": company.get("recent_news", ""),
+                "website": company.get("website"),
+                "decision_maker_name": dm.get("decision_maker_name"),
+                "decision_maker_role": dm.get("decision_maker_role"),
+                "linkedin_url": dm.get("linkedin_url"),
+                "context_for_email": dm.get("context_for_email", ""),
+            })
+
+        logger.info("[enricher] Enriched %d companies", len(enriched))
+        return {"enriched_companies": enriched}
+
+    def _parse_batch(
+        self, raw: str, companies: List[Dict]
+    ) -> List[Dict[str, Any]]:
+        """Parse batch JSON array with fallback."""
         import re
+
         text = raw.strip()
         if text.startswith("```"):
             lines = text.split("\n")
             text = "\n".join(lines[1:-1]) if len(lines) > 2 else text
 
         try:
-            return json.loads(text)
+            data = json.loads(text)
+            if isinstance(data, list):
+                return data
         except (json.JSONDecodeError, ValueError):
             pass
 
         try:
             cleaned = re.sub(r'[\x00-\x1f\x7f]', lambda m: repr(m.group())[1:-1], text)
-            return json.loads(cleaned)
+            data = json.loads(cleaned)
+            if isinstance(data, list):
+                return data
         except (json.JSONDecodeError, ValueError):
             pass
 
-        logger.warning("[enricher] Failed to parse decision maker JSON")
+        logger.warning("[enricher] Failed to parse batch JSON, returning empty enrichment")
+        return [self._empty_enriched(c) for c in companies]
+
+    def _empty_enriched(self, company: Dict) -> Dict[str, Any]:
         return {
+            "company": company.get("name", ""),
             "decision_maker_name": None,
             "decision_maker_role": None,
             "linkedin_url": None,
-            "context_for_email": None,
-        }
-
-    def _build_enriched_company(
-        self,
-        company: Dict[str, Any],
-        decision_maker: Dict[str, Any] | None,
-    ) -> Dict[str, Any]:
-        """Combine company data with decision maker info."""
-        dm = decision_maker or {}
-        return {
-            "company": company.get("name", ""),
-            "description": company.get("description", ""),
-            "funding_stage": company.get("funding_stage", "unknown"),
-            "recent_news": company.get("recent_news", ""),
-            "website": company.get("website"),
-            "decision_maker_name": dm.get("decision_maker_name"),
-            "decision_maker_role": dm.get("decision_maker_role"),
-            "linkedin_url": dm.get("linkedin_url"),
-            "context_for_email": dm.get("context_for_email", ""),
+            "context_for_email": "",
         }

@@ -116,26 +116,33 @@ Extract structured company information from these results."""
         """
         Build 2-3 short, targeted search queries from the planner instruction.
 
-        Tavily has a query length limit (~400 chars) and performs better with
-        concise queries. Extract the core intent rather than passing the full
-        instruction verbatim.
+        Strips tool-specific language (Tavily, web search, etc.) and extracts
+        the core search intent. Hard cap at 100 chars.
         """
-        # Truncate instruction to extract key terms only
-        # Take first sentence or first 100 chars — that's the core intent
-        core = instruction.split(".")[0].split("\n")[0].strip()
+        import re
 
-        # Hard cap at 100 chars to stay well within Tavily limits
+        # Strip tool/meta language the planner sometimes includes
+        cleaned = re.sub(
+            r'\b(use|using|via|with|search|tavily|web search|google|return \d+ results?|limit results? to \d+)\b',
+            ' ',
+            instruction,
+            flags=re.IGNORECASE,
+        )
+
+        # Take first sentence / clause as the core intent
+        core = cleaned.split(".")[0].split("\n")[0].split(",")[0].strip()
+        core = re.sub(r'\s+', ' ', core).strip()
+
+        # Hard cap at 100 chars, cut at word boundary
         if len(core) > 100:
-            # Try to cut at a word boundary
             core = core[:100].rsplit(" ", 1)[0]
 
+        if not core:
+            core = instruction[:80]
+
         queries = [core]
-
-        # Add a funding-focused variant
-        queries.append(f"{core[:80]} funding 2024 2025")
-
-        # Add a news-focused variant
-        queries.append(f"{core[:80]} recent news")
+        queries.append(f"{core[:75]} funding 2024 2025")
+        queries.append(f"{core[:75]} recent news")
 
         return queries[:3]
 

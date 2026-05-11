@@ -40,6 +40,9 @@ class Settings(BaseSettings):
     PREMIUM_MODEL: str = "llama-3.1-8b-instant"
 
     # Iterative refinement
+    # FREE tier: always 1 iteration (single-pass, no critic loop)
+    # PREMIUM tier: up to MAX_CRITIC_ITERATIONS, exits early if score >= threshold
+    FREE_CRITIC_ITERATIONS: int = 1
     MAX_CRITIC_ITERATIONS: int = 5
     PREMIUM_QUALITY_THRESHOLD: float = 8.5
 

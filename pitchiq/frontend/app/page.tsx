@@ -63,7 +63,10 @@ export default function Home() {
           {/* Loading state — agent list */}
           {appState === 'loading' && (
             <div className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-xl p-5 space-y-3">
-              <p className="text-[#555] text-xs uppercase tracking-wider">Running agents</p>
+              <div className="flex items-center justify-between">
+                <p className="text-[#555] text-xs uppercase tracking-wider">Running agents</p>
+                <p className="text-[#444] text-xs">~2–4 min on free tier</p>
+              </div>
               {['Planner', 'Researcher', 'Enricher', 'Writer', 'Critic'].map((agent) => (
                 <div key={agent} className="flex items-center gap-3">
                   <span className="w-4 h-4 rounded-full border-2 border-[#333] border-t-[#666] animate-spin shrink-0" />

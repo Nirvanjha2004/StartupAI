@@ -20,7 +20,7 @@ _PLANNER_SYSTEM_PROMPT = """You are the Planner for PitchIQ, an AI-powered cold 
 Your job: analyze the user's task and produce a strict JSON execution plan.
 
 Available agents (you choose which ones are needed):
-- researcher: Uses Tavily web search to find companies, news, funding info
+- researcher: Searches the web to find companies, news, funding info
 - enricher: Finds decision maker names, roles, LinkedIn for each company
 - writer: Generates personalized cold outreach emails
 
@@ -29,14 +29,15 @@ Rules:
 - Never include "critic" — it runs automatically after all agents
 - If nothing to research → skip researcher
 - If no emails needed → skip writer
-- agent_instructions must be specific and actionable, not generic
+- agent_instructions must describe WHAT to find, not HOW (never mention Tavily, web search, or tool names)
+- Instructions must be plain search intent: e.g. "Find 4 US startups with recent Series A funding"
 
 Return ONLY this JSON, no preamble, no markdown:
 {
   "task_summary": "one sentence describing what will be done",
   "agents_required": ["researcher", "enricher", "writer"],
   "agent_instructions": {
-    "researcher": "specific search instructions",
+    "researcher": "plain description of what companies/info to find",
     "enricher": "specific enrichment instructions",
     "writer": "specific writing instructions with tone/style guidance"
   },
@@ -48,8 +49,8 @@ class PlannerAgent(BaseAgent):
     """Analyzes user task and produces structured agent execution plan."""
 
     def __init__(self, tier: str = "free"):
-        # Planner always uses premium regardless of user tier
-        super().__init__(name="planner", role="orchestration", tier="premium")
+        # Planner always uses free tier — structured JSON, no quality iteration needed
+        super().__init__(name="planner", role="orchestration", tier="free")
 
     async def execute(self, task: str, context: Dict[str, Any]) -> Dict[str, Any]:
         """

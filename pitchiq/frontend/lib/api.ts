@@ -14,7 +14,7 @@ export async function runTask(task: string, tier: string): Promise<TaskResponse>
   const body: TaskRequest = { task, user_tier: tier as 'free' | 'premium' }
 
   const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), 300_000)
+  const timeout = setTimeout(() => controller.abort(), 600_000) // 10 min
 
   try {
     const res = await fetch(`${API_BASE}/api/v1/task`, {
