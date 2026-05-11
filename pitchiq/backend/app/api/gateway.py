@@ -1,58 +1,114 @@
-"""Raw gateway endpoint for direct LLM calls"""
+"""
+POST /api/v1/chat — LLM Inference Gateway endpoint.
 
-from fastapi import APIRouter, HTTPException
+Handles both standard (JSON) and streaming (SSE) responses.
+Streaming is PREMIUM-only.
+"""
+
+from __future__ import annotations
+
+from typing import List, Literal, Optional
+
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-from app.gateway.router import ModelRouter
-from app.gateway.proxy import LLMProxy
-from app.gateway.streaming import StreamingHandler
+from pydantic import BaseModel, Field
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db.session import get_db
+from app.gateway.router import route
+from app.gateway.streaming import build_streaming_response
+from app.orchestrator.pipeline import run_inference
+from app.utils.logger import get_logger
+
+logger = get_logger("api.gateway")
 
 router = APIRouter()
-llm_proxy = LLMProxy()
+
+
+# ── Request / Response schemas ────────────────────────────────────────────────
+
+class Message(BaseModel):
+    role: str
+    content: str
+
 
 class ChatRequest(BaseModel):
-    context: str
-    query: str
-    stream: bool = False
+    prompt: str = Field(..., description="The user's prompt text")
+    messages: List[Message] = Field(
+        default_factory=list,
+        description="Conversation history in OpenAI format",
+    )
+    stream: bool = Field(False, description="Enable SSE streaming (PREMIUM only)")
+    user_tier: Literal["free", "premium"] = Field(
+        "free",
+        description="User tier — hardcoded for now, auth comes later",
+    )
+
 
 class ChatResponse(BaseModel):
     response: str
     model_used: str
-    tokens_used: int
+    quality_score: float
+    iterations: int
+    cached: bool
+    estimated_cost_usd: float
+    note: Optional[str] = None
 
-@router.post("/chat")
-async def chat(request: ChatRequest):
-    """Direct chat endpoint with model routing"""
-    
-    # Route to appropriate model
-    model = ModelRouter.route(request.context, request.query)
-    
-    # Prepare messages
-    messages = [
-        {"role": "system", "content": f"Context:\n{request.context}"},
-        {"role": "user", "content": request.query}
-    ]
-    
+
+# ── Endpoint ──────────────────────────────────────────────────────────────────
+
+@router.post("/chat", response_model=ChatResponse, summary="LLM Inference Gateway")
+async def chat(
+    request: ChatRequest,
+    db: AsyncSession = Depends(get_db),
+) -> ChatResponse | StreamingResponse:
+    """
+    Tiered LLM inference endpoint.
+
+    - FREE tier: single-pass Groq + one critic evaluation
+    - PREMIUM tier: iterative Claude + Groq critic loop (up to 5 rounds)
+    - Streaming (SSE) available for PREMIUM only
+    """
+
+    # ── Streaming path (PREMIUM only) ─────────────────────────────────────────
+    if request.stream:
+        if request.user_tier != "premium":
+            raise HTTPException(
+                status_code=403,
+                detail="Streaming is only available for PREMIUM users.",
+            )
+        decision = route(request.user_tier)
+        messages = [m.model_dump() for m in request.messages]
+        if not messages:
+            messages = [{"role": "user", "content": request.prompt}]
+        return build_streaming_response(model=decision["model"], messages=messages)
+
+    # ── Standard inference path ───────────────────────────────────────────────
+    messages = [m.model_dump() for m in request.messages]
+    if not messages:
+        # If no history provided, treat prompt as the sole user message
+        messages = [{"role": "user", "content": request.prompt}]
+
     try:
-        # Call LLM
-        response = await llm_proxy.call(model, messages)
-        
-        return ChatResponse(
-            response=response,
-            model_used=model,
-            tokens_used=0  # TODO: track tokens
+        result = await run_inference(
+            prompt=request.prompt,
+            messages=messages,
+            user_tier=request.user_tier,
+            db=db,
         )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as exc:
+        logger.error("Inference pipeline error: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=503,
+            detail=f"LLM service unavailable: {exc}",
+        )
 
-@router.post("/chat/stream")
-async def chat_stream(request: ChatRequest):
-    """Streaming chat endpoint"""
-    
-    model = ModelRouter.route(request.context, request.query)
-    
-    # TODO: Implement streaming generator
-    async def generate():
-        yield "data: {\"message\": \"Streaming not yet implemented\"}\n\n"
-    
-    return StreamingResponse(generate(), media_type="text/event-stream")
+    return ChatResponse(
+        response=result.response,
+        model_used=result.model_used,
+        quality_score=result.quality_score,
+        iterations=result.iterations,
+        cached=result.cached,
+        estimated_cost_usd=result.estimated_cost_usd,
+        note=result.note,
+    )

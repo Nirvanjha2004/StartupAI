@@ -1,26 +1,33 @@
 """FastAPI app entry point for PitchIQ"""
 
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
-from app.api import auth, tasks, gateway
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.api import auth, tasks
+from app.api import gateway as gateway_api
 from app.config import settings
+from app.db.session import close_db
+from app.utils.logger import get_logger
+
+logger = get_logger("main")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown logic"""
-    # Startup
-    print("Starting PitchIQ backend...")
+    logger.info("Starting PitchIQ backend...")
     yield
-    # Shutdown
-    print("Shutting down PitchIQ backend...")
+    logger.info("Shutting down PitchIQ backend...")
+    await close_db()
+
 
 app = FastAPI(
     title="PitchIQ",
-    description="AI-powered email generation for outreach",
+    description="AI-powered cold outreach — LLM Inference Gateway",
     version="1.0.0",
-    lifespan=lifespan
+    lifespan=lifespan,
 )
 
 # CORS middleware
@@ -32,11 +39,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Include routers
+# ── Routers ───────────────────────────────────────────────────────────────────
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 app.include_router(tasks.router, prefix="/api/tasks", tags=["tasks"])
-app.include_router(gateway.router, prefix="/api/chat", tags=["gateway"])
 
-@app.get("/health")
+# LLM Inference Gateway — primary endpoint
+app.include_router(gateway_api.router, prefix="/api/v1", tags=["gateway"])
+
+
+@app.get("/health", tags=["health"])
 async def health_check():
-    return {"status": "healthy"}
+    return {"status": "healthy", "service": "pitchiq-gateway"}

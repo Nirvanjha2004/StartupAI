@@ -1,36 +1,64 @@
-"""SSE streaming handler"""
+"""
+SSE streaming handler — PREMIUM tier only.
 
-from typing import AsyncGenerator
+Yields chunks in the format:
+    data: <chunk_text>\n\n
+
+Final chunk:
+    data: [DONE]\n\n
+
+Streaming skips the semantic cache (real-time responses are not cacheable).
+Token tracking happens after the stream completes.
+"""
+
+from __future__ import annotations
+
 import json
+from typing import AsyncGenerator
 
-class StreamingHandler:
-    """Handles Server-Sent Events streaming for real-time responses"""
-    
-    @staticmethod
-    async def stream_response(
-        generator: AsyncGenerator,
-        event_type: str = "message"
-    ) -> AsyncGenerator[str, None]:
-        """Convert async generator to SSE format"""
-        try:
-            async for chunk in generator:
-                sse_message = {
-                    "event": event_type,
-                    "data": chunk
-                }
-                yield f"data: {json.dumps(sse_message)}\n\n"
-        except Exception as e:
-            error_message = {
-                "event": "error",
-                "data": str(e)
-            }
-            yield f"data: {json.dumps(error_message)}\n\n"
-    
-    @staticmethod
-    def format_sse_message(content: str, event_type: str = "message") -> str:
-        """Format a single SSE message"""
-        data = {
-            "event": event_type,
-            "data": content
-        }
-        return f"data: {json.dumps(data)}\n\n"
+from fastapi.responses import StreamingResponse
+
+from app.gateway.proxy import stream_llm
+from app.utils.logger import get_logger
+
+logger = get_logger("streaming")
+
+
+async def _sse_generator(
+    model: str,
+    messages: list[dict],
+) -> AsyncGenerator[str, None]:
+    """Wrap stream_llm chunks into SSE format."""
+    try:
+        async for chunk in stream_llm(model, messages):
+            yield f"data: {chunk}\n\n"
+    except Exception as exc:
+        logger.error("Streaming error: %s", exc)
+        error_payload = json.dumps({"error": str(exc)})
+        yield f"data: {error_payload}\n\n"
+    finally:
+        yield "data: [DONE]\n\n"
+
+
+def build_streaming_response(
+    model: str,
+    messages: list[dict],
+) -> StreamingResponse:
+    """
+    Build a FastAPI StreamingResponse for SSE.
+
+    Args:
+        model:    LLM model identifier.
+        messages: Conversation messages to send to the model.
+
+    Returns:
+        StreamingResponse with media_type='text/event-stream'.
+    """
+    return StreamingResponse(
+        _sse_generator(model, messages),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )

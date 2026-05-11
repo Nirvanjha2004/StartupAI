@@ -1,60 +1,148 @@
-"""pgvector semantic cache for responses"""
+"""
+Semantic cache backed by pgvector.
 
+Table: prompt_cache
+Similarity threshold: 0.92 (cosine)
+Embedding model: jina-embeddings-v3 via Jina AI API (1024-dim)
+Endpoint: https://api.jina.ai/v1/embeddings
+"""
+
+from __future__ import annotations
+
+import uuid
 from typing import Optional
-from sqlalchemy import text
-from app.db.session import get_db
-from app.config import settings
 
-class SemanticCache:
-    """Cache responses using pgvector semantic similarity"""
-    
-    def __init__(self):
-        self.enabled = settings.CACHE_ENABLED
-        self.ttl = settings.CACHE_TTL
-        self.similarity_threshold = 0.95
-    
-    async def get(self, query_embedding: list, db=None) -> Optional[str]:
-        """Get cached response by semantic similarity"""
-        if not self.enabled or db is None:
-            return None
-        
-        # SQL query using pgvector similarity search
-        query = text("""
-            SELECT response 
-            FROM cache_entries 
-            WHERE embedding <-> :embedding < :threshold
-            AND created_at > NOW() - INTERVAL '1 hour'
-            LIMIT 1
-        """)
-        
-        try:
-            result = await db.execute(
-                query,
-                {"embedding": query_embedding, "threshold": 1 - self.similarity_threshold}
+import httpx
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.config import settings
+from app.utils.logger import get_logger
+
+logger = get_logger("cache")
+
+_JINA_ENDPOINT = "https://api.jina.ai/v1/embeddings"
+_JINA_MODEL = "jina-embeddings-v3"
+_JINA_DIMENSIONS = 1024
+# task=retrieval.query for lookups, retrieval.passage for storing
+_TASK_QUERY = "retrieval.query"
+_TASK_PASSAGE = "retrieval.passage"
+
+
+async def _embed(text_input: str, task: str) -> list[float]:
+    """
+    Call the Jina AI embeddings API and return a 1024-dim vector.
+    Raises httpx.HTTPError on failure — callers should catch and handle.
+    """
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {settings.JINA_API_KEY}",
+    }
+    payload = {
+        "input": [text_input],
+        "model": _JINA_MODEL,
+        "dimensions": _JINA_DIMENSIONS,
+        "task": task,
+    }
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.post(_JINA_ENDPOINT, headers=headers, json=payload)
+        response.raise_for_status()
+        return response.json()["data"][0]["embedding"]
+
+
+class CacheResult:
+    def __init__(self, response_text: str, model_used: str, quality_score: float):
+        self.response_text = response_text
+        self.model_used = model_used
+        self.quality_score = quality_score
+
+
+async def cache_get(prompt: str, db: AsyncSession) -> Optional[CacheResult]:
+    """
+    Look up a semantically similar prompt in the cache.
+
+    Returns CacheResult on hit (cosine similarity >= 0.92), None on miss.
+    Swallows all errors so the pipeline never crashes on cache failure.
+    """
+    if not settings.CACHE_ENABLED:
+        return None
+
+    try:
+        embedding = await _embed(prompt, task=_TASK_QUERY)
+        embedding_str = "[" + ",".join(str(v) for v in embedding) + "]"
+
+        # pgvector cosine distance = 1 - cosine_similarity
+        # distance < (1 - threshold)  ↔  similarity > threshold
+        distance_threshold = 1.0 - settings.CACHE_SIMILARITY_THRESHOLD
+
+        result = await db.execute(
+            text(
+                """
+                SELECT response_text, model_used, quality_score
+                FROM prompt_cache
+                WHERE embedding <=> CAST(:emb AS vector) < :dist
+                ORDER BY embedding <=> CAST(:emb AS vector)
+                LIMIT 1
+                """
+            ),
+            {"emb": embedding_str, "dist": distance_threshold},
+        )
+        row = result.fetchone()
+        if row:
+            logger.info("Cache HIT  — prompt[:60]: %s", prompt[:60])
+            return CacheResult(
+                response_text=row[0],
+                model_used=row[1],
+                quality_score=row[2] or 0.0,
             )
-            row = result.first()
-            return row[0] if row else None
-        except Exception as e:
-            print(f"Cache get error: {e}")
-            return None
-    
-    async def set(self, query_embedding: list, response: str, db=None) -> bool:
-        """Cache response with embedding"""
-        if not self.enabled or db is None:
-            return False
-        
-        try:
-            # Insert into cache with pgvector embedding
-            insert_query = text("""
-                INSERT INTO cache_entries (embedding, response, created_at)
-                VALUES (:embedding, :response, NOW())
-            """)
-            await db.execute(
-                insert_query,
-                {"embedding": query_embedding, "response": response}
-            )
-            await db.commit()
-            return True
-        except Exception as e:
-            print(f"Cache set error: {e}")
-            return False
+
+        logger.info("Cache MISS — prompt[:60]: %s", prompt[:60])
+        return None
+
+    except Exception as exc:
+        logger.warning("Cache read failed (continuing without cache): %s", exc)
+        return None
+
+
+async def cache_set(
+    prompt: str,
+    response_text: str,
+    model_used: str,
+    quality_score: float,
+    db: AsyncSession,
+) -> None:
+    """
+    Store a prompt + response in the semantic cache.
+    Swallows all errors so the pipeline never crashes on cache write failure.
+    """
+    if not settings.CACHE_ENABLED:
+        return
+
+    try:
+        embedding = await _embed(prompt, task=_TASK_PASSAGE)
+        embedding_str = "[" + ",".join(str(v) for v in embedding) + "]"
+
+        await db.execute(
+            text(
+                """
+                INSERT INTO prompt_cache
+                    (id, prompt_text, embedding, response_text, model_used, quality_score)
+                VALUES
+                    (:id, :prompt_text, CAST(:embedding AS vector), :response_text, :model_used, :quality_score)
+                """
+            ),
+            {
+                "id": str(uuid.uuid4()),
+                "prompt_text": prompt,
+                "embedding": embedding_str,
+                "response_text": response_text,
+                "model_used": model_used,
+                "quality_score": quality_score,
+            },
+        )
+        await db.commit()
+        logger.info("Cached response — prompt[:60]: %s", prompt[:60])
+
+    except Exception as exc:
+        logger.warning("Cache write failed (non-fatal): %s", exc)
+        await db.rollback()

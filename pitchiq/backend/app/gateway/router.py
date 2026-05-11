@@ -1,25 +1,35 @@
-"""Model routing logic (simple→Groq, complex→Claude)"""
+"""
+Model Router — maps user tier to inference strategy and model.
 
-from enum import Enum
+Tier alone determines routing; no complexity classification needed.
+"""
 
-class ModelRouter:
-    """Routes queries to appropriate LLM based on complexity"""
-    
-    SIMPLE_MODEL = "groq"
-    COMPLEX_MODEL = "claude"
-    
-    @staticmethod
-    def is_simple_query(context_lines: int, query_length: int) -> bool:
-        """Determine if query is simple based on heuristics"""
-        # Simple if context is small and query is straightforward
-        return context_lines < 3 and query_length < 200
-    
-    @staticmethod
-    def route(context: str, query: str) -> str:
-        """Route query to appropriate model"""
-        context_lines = len(context.split("\n"))
-        query_length = len(query)
-        
-        if ModelRouter.is_simple_query(context_lines, query_length):
-            return ModelRouter.SIMPLE_MODEL
-        return ModelRouter.COMPLEX_MODEL
+from __future__ import annotations
+
+from typing import Literal, TypedDict
+
+from app.config import settings
+
+
+class RouteDecision(TypedDict):
+    strategy: Literal["single_pass", "iterative"]
+    model: str
+
+
+def route(user_tier: Literal["free", "premium"]) -> RouteDecision:
+    """
+    Return the inference strategy and model for the given user tier.
+
+    FREE    → single_pass  with groq/llama-3.1-8b-instant
+    PREMIUM → iterative    with claude-sonnet-4-20250514
+    """
+    if user_tier == "premium":
+        return RouteDecision(
+            strategy="iterative",
+            model=settings.CLAUDE_QUALITY_MODEL,
+        )
+    # Default: free tier
+    return RouteDecision(
+        strategy="single_pass",
+        model=settings.GROQ_CHEAP_MODEL,
+    )
