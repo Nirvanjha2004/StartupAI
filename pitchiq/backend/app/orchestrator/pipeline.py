@@ -21,8 +21,9 @@ PREMIUM tier:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Optional
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -120,7 +121,7 @@ async def _run_free_pipeline(
 ) -> PipelineResult:
     total_cost = 0.0
 
-    # LLM call — fallback to Claude if Groq fails
+    # LLM call — fallback to premium model if primary fails
     try:
         llm_response = await call_llm(model=model, messages=messages)
     except Exception as exc:
@@ -181,7 +182,7 @@ async def _run_premium_pipeline(
     task_id: Optional[str],
 ) -> PipelineResult:
     total_cost = 0.0
-    current_messages = list(messages)  # mutable copy
+    current_messages = list(messages)
 
     best_response: str = ""
     best_score: float = 0.0
@@ -190,7 +191,7 @@ async def _run_premium_pipeline(
     note: Optional[str] = None
 
     for iteration in range(1, settings.MAX_CRITIC_ITERATIONS + 1):
-        # LLM call — fallback to Claude if primary fails
+        # LLM call — fallback if primary fails
         try:
             llm_response = await call_llm(model=model, messages=current_messages)
         except Exception as exc:
@@ -236,17 +237,14 @@ async def _run_premium_pipeline(
             current_score,
         )
 
-        # Track best response
         if current_score > best_score:
             best_score = current_score
             best_response = llm_response.text
             best_model = llm_response.model
 
-        # Exit if quality threshold met
         if current_score >= settings.PREMIUM_QUALITY_THRESHOLD:
             break
 
-        # Append feedback and ask for a rewrite (only if critic succeeded)
         if current_score > 0:
             feedback = getattr(critic_result, "feedback", "Improve quality")
             current_messages = current_messages + [
@@ -261,11 +259,9 @@ async def _run_premium_pipeline(
                 },
             ]
         else:
-            # Critic failed, can't iterate — exit loop
             logger.warning("Critic unavailable, exiting iteration loop early")
             break
     else:
-        # Loop exhausted without hitting threshold
         note = "Max iterations reached"
         logger.info("Premium pipeline hit max iterations. Best score: %.1f", best_score)
 
@@ -287,17 +283,24 @@ def _tier_note(user_tier: str) -> Optional[str]:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Multi-Agent Pipeline (separate from gateway inference)
+# Agent Orchestration Pipeline (separate from gateway inference)
 # ═════════════════════════════════════════════════════════════════════════════
 
 from typing import Any, Dict, List
 
 
-class Pipeline:
+class AgentPipeline:
     """
-    Multi-agent orchestrator pipeline (planner → researcher → enricher → writer → critic).
-    This is separate from the gateway inference pipeline above.
-    Used by tasks.py for full cold-outreach email generation.
+    Executes the multi-agent orchestration plan.
+
+    Flow:
+    1. Create task in DB
+    2. Call PlannerAgent → get plan
+    3. Save plan to DB, update status: running
+    4. Loop through plan.agents_required in order
+    5. Always run CriticAgent last
+    6. Compile final_output
+    7. Update status: completed
     """
 
     def __init__(self):
@@ -306,63 +309,175 @@ class Pipeline:
         from app.agents.enricher import EnricherAgent
         from app.agents.writer import WriterAgent
         from app.agents.critic import CriticAgent
+        from app.orchestrator.state import StateManager
 
-        self.planner = PlannerAgent()
-        self.researcher = ResearcherAgent()
-        self.enricher = EnricherAgent()
-        self.writer = WriterAgent()
-        self.critic = CriticAgent()
+        self.state = StateManager()
+        self._agent_registry = {
+            "researcher": ResearcherAgent,
+            "enricher": EnricherAgent,
+            "writer": WriterAgent,
+        }
+        self._planner = PlannerAgent()
+        self._critic = CriticAgent()
+
+    async def run(
+        self,
+        task: str,
+        user_tier: str,
+        db: AsyncSession,
+        user_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Execute full agent pipeline for a task.
+
+        Returns final_output dict.
+        """
+        start_time = time.monotonic()
+
+        # 1. Create task in DB
+        task_id = await self.state.create_task(task, user_tier, db, user_id)
+        logger.info("AgentPipeline starting task %s", task_id)
+
+        try:
+            # 2. Plan
+            logger.info("[pipeline] Running planner...")
+            plan = await self._planner.execute(task, {})
+            await self.state.save_plan(task_id, plan, db)
+            await self.state.update_status(task_id, "running", db)
+
+            agents_required: List[str] = plan.get("agents_required", [])
+            agent_instructions: Dict[str, str] = plan.get("agent_instructions", {})
+
+            logger.info("[pipeline] Plan: %s", agents_required)
+
+            # 3. Execute each agent in order
+            for agent_name in agents_required:
+                if agent_name not in self._agent_registry:
+                    logger.warning("[pipeline] Unknown agent '%s', skipping", agent_name)
+                    continue
+
+                instruction = str(agent_instructions.get(agent_name, task))
+                context = await self.state.get_context(task_id, db)
+
+                logger.info("[pipeline] Running agent: %s", agent_name)
+                agent = self._agent_registry[agent_name](tier=user_tier)
+
+                try:
+                    output = await agent.execute(instruction, context)
+                    await self.state.save_agent_output(task_id, agent_name, output, db)
+                    logger.info("[pipeline] Agent %s completed", agent_name)
+                except Exception as exc:
+                    error_msg = f"Agent '{agent_name}' failed: {exc}"
+                    logger.error("[pipeline] %s", error_msg)
+                    await self.state.fail_task(task_id, error_msg, db)
+                    raise RuntimeError(error_msg) from exc
+
+            # 4. Always run critic last
+            logger.info("[pipeline] Running critic...")
+            final_context = await self.state.get_context(task_id, db)
+            try:
+                critic_output = await self._critic.execute(task, final_context)
+                await self.state.save_agent_output(task_id, "critic", critic_output, db)
+            except Exception as exc:
+                logger.warning("[pipeline] Critic failed (non-fatal): %s", exc)
+                critic_output = {
+                    "overall_score": 0.0,
+                    "feedback": "Evaluation unavailable",
+                    "emails_reviewed": 0,
+                }
+
+            # 5. Compile final output
+            execution_time_ms = int((time.monotonic() - start_time) * 1000)
+            final_context = await self.state.get_context(task_id, db)
+            final_output = self._compile_output(
+                task=task,
+                plan=plan,
+                context=final_context,
+                critic_output=critic_output,
+                agents_used=agents_required,
+                execution_time_ms=execution_time_ms,
+                planner_cost=self._planner.total_cost,
+            )
+
+            # 6. Complete task
+            total_cost = sum(
+                self._agent_registry[a](tier=user_tier).total_cost
+                for a in agents_required
+                if a in self._agent_registry
+            )
+            total_cost += self._planner.total_cost + self._critic.total_cost
+
+            await self.state.complete_task(
+                task_id=task_id,
+                final_output=final_output,
+                total_cost_usd=final_output["total_cost_usd"],
+                total_tokens=0,
+                db=db,
+            )
+
+            logger.info(
+                "[pipeline] Task %s completed in %dms",
+                task_id,
+                execution_time_ms,
+            )
+            return {**final_output, "task_id": task_id}
+
+        except Exception as exc:
+            await self.state.fail_task(task_id, str(exc), db)
+            raise
+
+    def _compile_output(
+        self,
+        task: str,
+        plan: Dict[str, Any],
+        context: Dict[str, Any],
+        critic_output: Dict[str, Any],
+        agents_used: List[str],
+        execution_time_ms: int,
+        planner_cost: float,
+    ) -> Dict[str, Any]:
+        """Compile all agent outputs into final response."""
+        # Collect emails from writer
+        writer_output = context.get("writer", {})
+        emails = writer_output.get("emails", [])
+
+        # Count companies researched
+        researcher_output = context.get("researcher", {})
+        companies_researched = len(researcher_output.get("companies", []))
+
+        # Estimate total cost (gateway tracks actual costs in token_usage)
+        total_cost = planner_cost
+
+        return {
+            "task": task,
+            "task_summary": plan.get("task_summary", ""),
+            "emails": emails,
+            "companies_researched": companies_researched,
+            "critic_score": critic_output.get("overall_score", 0.0),
+            "critic_feedback": critic_output.get("feedback", ""),
+            "total_cost_usd": round(total_cost, 6),
+            "total_tokens": 0,  # Tracked in token_usage table
+            "agents_used": ["planner"] + agents_used + ["critic"],
+            "execution_time_ms": execution_time_ms,
+        }
+
+
+# Keep the old Pipeline class for backward compatibility with tasks.py
+class Pipeline:
+    """Legacy multi-agent pipeline — delegates to AgentPipeline."""
+
+    def __init__(self):
+        self._pipeline = AgentPipeline()
         self.execution_log: List[Dict[str, Any]] = []
 
     async def run(self, task: str, config: Dict[str, Any] = None) -> Dict[str, Any]:
-        """Execute full multi-agent pipeline."""
+        """Execute full pipeline. Requires db session via config."""
         config = config or {}
+        db = config.get("db")
+        user_tier = config.get("user_tier", "free")
+        user_id = config.get("user_id")
 
-        results = {
-            "plan": None,
-            "research": None,
-            "enrichment": None,
-            "draft": None,
-            "final": None,
-            "scores": None,
-        }
+        if db is None:
+            raise ValueError("Pipeline.run() requires config['db'] = AsyncSession")
 
-        try:
-            # Stage 1: Planning
-            results["plan"] = await self.planner.execute(task)
-            self._log_stage("planning", results["plan"])
-
-            # Stage 2: Research
-            results["research"] = await self.researcher.execute(results["plan"])
-            self._log_stage("research", results["research"])
-
-            # Stage 3: Enrichment
-            results["enrichment"] = await self.enricher.execute(results["research"])
-            self._log_stage("enrichment", results["enrichment"])
-
-            # Stage 4: Writing
-            results["draft"] = await self.writer.execute(results["enrichment"])
-            self._log_stage("writing", results["draft"])
-
-            # Stage 5: Criticism
-            results["scores"] = await self.critic.score(
-                results["draft"], ["clarity", "relevance", "tone"]
-            )
-            self._log_stage("criticism", str(results["scores"]))
-
-            # Final output
-            results["final"] = results["draft"]
-
-            return results
-
-        except Exception as e:
-            self._log_stage("error", str(e))
-            raise
-
-    def _log_stage(self, stage: str, output: str) -> None:
-        """Log pipeline stage execution."""
-        self.execution_log.append({
-            "stage": stage,
-            "output": output[:200],  # Log first 200 chars
-            "timestamp": None,  # TODO: add timestamp
-        })
+        return await self._pipeline.run(task, user_tier, db, user_id)

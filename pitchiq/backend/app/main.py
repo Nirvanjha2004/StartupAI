@@ -5,8 +5,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import auth, tasks
+from app.api import auth
 from app.api import gateway as gateway_api
+from app.api import tasks as tasks_api
 from app.config import settings
 from app.db.session import close_db
 from app.utils.logger import get_logger
@@ -25,7 +26,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="PitchIQ",
-    description="AI-powered cold outreach — LLM Inference Gateway",
+    description="AI-powered cold outreach — LLM Inference Gateway + Agent Orchestration",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -41,12 +42,14 @@ app.add_middleware(
 
 # ── Routers ───────────────────────────────────────────────────────────────────
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
-app.include_router(tasks.router, prefix="/api/tasks", tags=["tasks"])
 
-# LLM Inference Gateway — primary endpoint
+# LLM Inference Gateway
 app.include_router(gateway_api.router, prefix="/api/v1", tags=["gateway"])
+
+# Agent Orchestration
+app.include_router(tasks_api.router, prefix="/api/v1", tags=["tasks"])
 
 
 @app.get("/health", tags=["health"])
 async def health_check():
-    return {"status": "healthy", "service": "pitchiq-gateway"}
+    return {"status": "healthy", "service": "pitchiq"}

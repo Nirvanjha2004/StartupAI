@@ -1,22 +1,29 @@
 """
-Critic agent — scores quality and suggests improvements.
+Critic Agent — two roles in one file:
 
-Serves two roles:
-  1. Pipeline inference critic: called by the gateway pipeline to gate/refine
-     LLM responses. Returns strict JSON {score, feedback} via run_critic().
-  2. Agent-layer critic: used by the orchestrator pipeline to score drafts
-     on multiple dimensions (clarity, relevance, tone) via score().
+1. Agent-level critic (CriticAgent class):
+   Evaluates the FINAL task output holistically.
+   Scores overall output 1-10, gives one actionable improvement.
+   Uses FREE tier gateway.
+   Runs AFTER all other agents complete, always.
+
+2. Gateway-level critic (run_critic function):
+   Used by the inference pipeline to gate/refine LLM responses.
+   Returns strict JSON {score, feedback}.
+   Always uses Groq cheap model.
 """
 
 from __future__ import annotations
 
 import json
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from app.agents.base import BaseAgent
 from app.utils.logger import get_logger
 
 logger = get_logger("critic")
+
+# ── Gateway-level critic ──────────────────────────────────────────────────────
 
 _INFERENCE_CRITIC_SYSTEM_PROMPT = """You are a strict quality evaluator for AI-generated sales outreach content.
 
@@ -92,34 +99,113 @@ async def run_critic(original_prompt: str, current_response: str) -> CriticResul
     )
 
 
+# ── Agent-level critic ────────────────────────────────────────────────────────
+
+_AGENT_CRITIC_SYSTEM_PROMPT = """You are a senior B2B sales strategist reviewing AI-generated cold outreach emails.
+
+Evaluate the complete set of emails holistically and return ONLY this JSON, no preamble, no markdown:
+{
+  "overall_score": <float 1-10>,
+  "feedback": "<one actionable improvement that would most increase reply rates>",
+  "emails_reviewed": <int>
+}
+
+Scoring guide:
+- 9-10: Exceptional personalization, compelling CTAs, ready to send
+- 7-8.9: Good quality, minor improvements needed
+- 5-6.9: Acceptable but generic in places
+- 3-4.9: Weak personalization or unclear value proposition
+- 1-2.9: Generic templates, unlikely to get replies"""
+
+
 class CriticAgent(BaseAgent):
     """
-    Agent-layer critic used by the orchestrator pipeline.
-    Scores drafts on multiple dimensions (clarity, relevance, tone).
+    Agent-level critic — evaluates the final task output holistically.
+    Runs after all other agents complete.
     """
 
-    def __init__(self):
-        super().__init__(name="Critic", model="claude")
-        self._setup_tools()
+    def __init__(self, tier: str = "free"):
+        super().__init__(name="critic", role="evaluation", tier="free")
 
-    def _setup_tools(self):
-        self.add_tool({
-            "name": "score_output",
-            "description": "Score output on multiple dimensions",
-            "parameters": {"output": "str", "criteria": "list"},
-        })
-        self.add_tool({
-            "name": "suggest_improvements",
-            "description": "Suggest improvements to output",
-            "parameters": {"output": "str", "scores": "dict"},
-        })
+    async def execute(self, task: str, context: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Evaluate all generated emails holistically.
 
-    async def score(self, output: str, criteria: list) -> Dict[str, float]:
-        """Score output on given criteria, returns {criterion: 0-1}."""
-        # TODO: Call LLM and parse per-criterion scores
-        return {}
+        Args:
+            task:    Original user task.
+            context: All agent outputs including writer emails.
 
-    async def _execute_task(self, task: str) -> str:
-        """Evaluate and suggest improvements."""
-        # TODO: Call LLM with critic tools
-        return task
+        Returns:
+            Dict with overall_score, feedback, emails_reviewed.
+        """
+        logger.info("[critic] Evaluating final output for task: %s", task[:60])
+
+        # Collect all emails from writer output
+        writer_output = context.get("writer", {})
+        emails: List[Dict[str, Any]] = writer_output.get("emails", [])
+
+        if not emails:
+            logger.warning("[critic] No emails to evaluate")
+            return {
+                "overall_score": 0.0,
+                "feedback": "No emails were generated to evaluate.",
+                "emails_reviewed": 0,
+            }
+
+        # Format emails for review
+        emails_text = self._format_emails(emails)
+
+        prompt = f"""Original task: {task}
+
+Generated emails:
+{emails_text}
+
+Evaluate these cold outreach emails holistically."""
+
+        messages = [
+            {"role": "system", "content": _AGENT_CRITIC_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ]
+
+        gw = await self._call_gateway(prompt=prompt, messages=messages)
+        result = self._parse_result(gw.response, len(emails))
+
+        logger.info(
+            "[critic] Score: %.1f/10 — %s",
+            result["overall_score"],
+            result["feedback"][:60],
+        )
+        return result
+
+    def _format_emails(self, emails: List[Dict[str, Any]]) -> str:
+        """Format emails list for critic review."""
+        parts = []
+        for i, email in enumerate(emails, 1):
+            parts.append(
+                f"Email {i} — To: {email.get('to', 'Unknown')} at {email.get('company', 'Unknown')}\n"
+                f"Subject: {email.get('subject', '')}\n"
+                f"{email.get('body', '')}"
+            )
+        return "\n\n---\n\n".join(parts)
+
+    def _parse_result(self, raw: str, email_count: int) -> Dict[str, Any]:
+        """Parse critic JSON with fallback."""
+        text = raw.strip()
+        if text.startswith("```"):
+            lines = text.split("\n")
+            text = "\n".join(lines[1:-1]) if len(lines) > 2 else text
+
+        try:
+            data = json.loads(text)
+            return {
+                "overall_score": float(data.get("overall_score", 5.0)),
+                "feedback": str(data.get("feedback", "Could not evaluate")),
+                "emails_reviewed": int(data.get("emails_reviewed", email_count)),
+            }
+        except (json.JSONDecodeError, ValueError) as exc:
+            logger.warning("[critic] Failed to parse result JSON: %s", exc)
+            return {
+                "overall_score": 5.0,
+                "feedback": "Could not evaluate",
+                "emails_reviewed": email_count,
+            }
