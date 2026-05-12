@@ -1,36 +1,7 @@
 services:
-  # PostgreSQL 15 with pgvector extension
-  postgres:
-    image: pgvector/pgvector:pg15
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: pitchiq
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d pitchiq"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  # Redis 7
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
   # PitchIQ backend
+  # PostgreSQL → Supabase (external)
+  # Redis      → Upstash  (external)
   backend:
     build:
       context: ./backend
@@ -39,15 +10,6 @@ services:
       - "8000:8000"
     env_file:
       - ./backend/.env
-    environment:
-      # Override DB/Redis to use container hostnames, not localhost
-      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/pitchiq
-      REDIS_URL: redis://redis:6379
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
     volumes:
       - ./backend:/app
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
@@ -55,10 +17,3 @@ services:
       - 8.8.8.8
       - 1.1.1.1
       - 8.8.4.4
-    extra_hosts:
-      - "api.jina.ai:104.26.10.242"
-      - "api.tavily.com:34.197.11.229"
-
-volumes:
-  postgres_data:
-  redis_data:

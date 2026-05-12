@@ -5,10 +5,13 @@ from typing import List
 
 
 class Settings(BaseSettings):
-    # Database
+    # Database — Supabase Transaction pooler
+    # Format: postgresql+asyncpg://postgres.[ref]:[pass]@aws-0-[region].pooler.supabase.com:6543/postgres?ssl=require
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/pitchiq"
 
-    # Redis
+    # Redis — Upstash (TLS) or local
+    # Upstash format: rediss://default:[pass]@[endpoint].upstash.io:6379
+    # Local format:   redis://localhost:6379
     REDIS_URL: str = "redis://localhost:6379"
 
     # API Keys

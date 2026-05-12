@@ -1,15 +1,19 @@
 """
-Task event emitter — pushes SSE events to Redis list.
+Task event emitter — pushes SSE events to a Redis list.
 
-Key: task_events:{task_id}
-Each value: JSON string of the event.
-Sentinel: "DONE" pushed when pipeline finishes.
-TTL: 1 hour after task completes.
+Key:      task_events:{task_id}
+Values:   JSON-encoded event dicts
+Sentinel: "DONE" string pushed when pipeline finishes
+TTL:      1 hour
+
+Works with both local Redis (redis://) and Upstash (rediss://).
+The rediss:// scheme enables TLS automatically via the redis-py client.
 """
 
 from __future__ import annotations
 
 import json
+import ssl
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -26,8 +30,27 @@ _redis: Optional[redis_sync.Redis] = None
 def _get_redis() -> redis_sync.Redis:
     global _redis
     if _redis is None:
-        _redis = redis_sync.from_url(settings.REDIS_URL, decode_responses=False)
+        _redis = _make_redis_client()
     return _redis
+
+
+def _make_redis_client() -> redis_sync.Redis:
+    """
+    Build a redis-py client from REDIS_URL.
+
+    For Upstash (rediss://): redis-py enables TLS automatically when the scheme
+    is rediss://. We pass ssl_cert_reqs=None so it doesn't try to verify
+    Upstash's certificate against the system CA bundle (which often fails in
+    Docker containers with minimal CA stores).
+    """
+    url = settings.REDIS_URL
+    if url.startswith("rediss://"):
+        return redis_sync.from_url(
+            url,
+            decode_responses=False,
+            ssl_cert_reqs=None,          # skip cert verification for Upstash
+        )
+    return redis_sync.from_url(url, decode_responses=False)
 
 
 def _now() -> str:
@@ -39,7 +62,6 @@ def _push(task_id: str, event: Dict[str, Any]) -> None:
     try:
         key = f"task_events:{task_id}"
         _get_redis().rpush(key, json.dumps(event))
-        # Refresh TTL on every push — 1 hour
         _get_redis().expire(key, 3600)
     except Exception as exc:
         logger.warning("Event push failed (non-fatal): %s", exc)
@@ -111,7 +133,6 @@ def emit_task_completed(
         "critic_score": critic_score,
         "timestamp": _now(),
     })
-    # Push sentinel
     try:
         _get_redis().rpush(f"task_events:{task_id}", "DONE")
     except Exception:

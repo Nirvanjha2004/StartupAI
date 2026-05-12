@@ -192,8 +192,12 @@ async def _sse_generator(task_id: str) -> AsyncGenerator[str, None]:
     import redis as redis_sync
     from app.config import settings
 
+    url = settings.REDIS_URL
     try:
-        r = redis_sync.from_url(settings.REDIS_URL, decode_responses=False)
+        if url.startswith("rediss://"):
+            r = redis_sync.from_url(url, decode_responses=False, ssl_cert_reqs=None)
+        else:
+            r = redis_sync.from_url(url, decode_responses=False)
     except Exception as exc:
         yield f"data: {json.dumps({'type': 'task_failed', 'message': f'Redis unavailable: {exc}'})}\n\n"
         yield "data: [DONE]\n\n"
