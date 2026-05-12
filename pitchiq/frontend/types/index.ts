@@ -31,7 +31,30 @@ export interface TaskResponse {
   final_output: FinalOutput | null
 }
 
-// ── Dashboard ─────────────────────────────────────────────────────────────────
+// ── SSE Events ───────────────────────────────────────────────────────────────
+
+export type TaskEventType =
+  | 'task_started'
+  | 'plan_ready'
+  | 'agent_started'
+  | 'agent_log'
+  | 'agent_completed'
+  | 'task_completed'
+  | 'task_failed'
+
+export interface TaskEvent {
+  type: TaskEventType
+  message: string
+  timestamp: string
+  agent?: string
+  agents?: string[]
+  tokens?: number
+  cost_usd?: number
+  latency_ms?: number
+  total_cost_usd?: number
+  total_tokens?: number
+  critic_score?: number
+}
 
 export interface DashboardStats {
   total_tasks: number

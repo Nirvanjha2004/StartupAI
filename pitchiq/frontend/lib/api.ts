@@ -1,6 +1,7 @@
 import type {
   TaskRequest,
   TaskResponse,
+  TaskEvent,
   DashboardStats,
   TaskSummary,
   TaskBreakdown,
@@ -10,11 +11,15 @@ const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
 // ── Task endpoints ────────────────────────────────────────────────────────────
 
+/**
+ * Start a task. Returns task_id + final_output when pipeline completes.
+ * Connect to streamTask() immediately after getting task_id for live events.
+ */
 export async function runTask(task: string, tier: string): Promise<TaskResponse> {
   const body: TaskRequest = { task, user_tier: tier as 'free' | 'premium' }
 
   const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), 600_000) // 10 min
+  const timeout = setTimeout(() => controller.abort(), 600_000)
 
   try {
     const res = await fetch(`${API_BASE}/api/v1/task`, {
@@ -40,6 +45,40 @@ export async function getTask(taskId: string): Promise<TaskResponse> {
     throw new Error(err.detail || `Request failed: ${res.status}`)
   }
   return res.json()
+}
+
+/**
+ * Connect to SSE stream for a running task.
+ * Returns a cleanup function — call it on unmount.
+ */
+export function streamTask(
+  taskId: string,
+  onEvent: (event: TaskEvent) => void,
+  onDone: () => void,
+): () => void {
+  const url = `${API_BASE}/api/v1/task/${taskId}/stream`
+  const es = new EventSource(url)
+
+  es.onmessage = (e) => {
+    if (e.data === '[DONE]') {
+      es.close()
+      onDone()
+      return
+    }
+    try {
+      const event: TaskEvent = JSON.parse(e.data)
+      onEvent(event)
+    } catch {
+      // ignore malformed events
+    }
+  }
+
+  es.onerror = () => {
+    es.close()
+    onDone()
+  }
+
+  return () => es.close()
 }
 
 // ── Dashboard endpoints ───────────────────────────────────────────────────────

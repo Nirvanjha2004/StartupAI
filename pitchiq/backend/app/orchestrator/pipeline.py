@@ -328,19 +328,31 @@ class AgentPipeline:
         user_tier: str,
         db: AsyncSession,
         user_id: Optional[str] = None,
+        task_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Execute full agent pipeline for a task.
 
+        Args:
+            task_id: If provided, use this ID (pre-created). Otherwise create new.
         Returns final_output dict.
         """
+        from app.services.event_emitter import (
+            emit_task_started, emit_plan_ready, emit_agent_started,
+            emit_agent_log, emit_agent_completed, emit_task_completed,
+            emit_task_failed,
+        )
+
         start_time = time.monotonic()
         from datetime import datetime, timezone
         task_start_dt = datetime.now(timezone.utc)
 
-        # 1. Create task in DB
-        task_id = await self.state.create_task(task, user_tier, db, user_id)
+        # 1. Create task in DB (or use pre-created id)
+        if task_id is None:
+            task_id = await self.state.create_task(task, user_tier, db, user_id)
         logger.info("AgentPipeline starting task %s", task_id)
+
+        emit_task_started(task_id, "Task received. Analyzing...")
 
         # Track agent instances so we can read their accumulated costs
         agent_instances: Dict[str, Any] = {}
@@ -348,13 +360,24 @@ class AgentPipeline:
         try:
             # 2. Plan
             logger.info("[pipeline] Running planner...")
+            emit_agent_started(task_id, "planner", "Planner analyzing task...")
+            t0 = time.monotonic()
             plan = await self._planner.execute(task, {})
+            planner_ms = int((time.monotonic() - t0) * 1000)
+
             await self.state.save_plan(task_id, plan, db)
             await self.state.update_status(task_id, "running", db)
 
             agents_required: List[str] = plan.get("agents_required", [])
             agent_instructions: Dict[str, str] = plan.get("agent_instructions", {})
 
+            emit_plan_ready(task_id, agents_required)
+            emit_agent_completed(
+                task_id, "planner",
+                f"Plan ready — {len(agents_required)} agents scheduled",
+                latency_ms=planner_ms,
+                cost_usd=self._planner.total_cost,
+            )
             logger.info("[pipeline] Plan: %s", agents_required)
 
             # 3. Execute each agent in order
@@ -366,94 +389,99 @@ class AgentPipeline:
                 instruction = str(agent_instructions.get(agent_name, task))
                 context = await self.state.get_context(task_id, db)
 
-                # Tier routing:
-                # - writer gets the user's actual tier (cascading on premium)
-                # - all other agents always use free (single-pass, fast)
                 agent_tier = user_tier if agent_name == "writer" else "free"
 
                 logger.info("[pipeline] Running agent: %s (tier=%s)", agent_name, agent_tier)
+                emit_agent_started(task_id, agent_name, f"{agent_name.capitalize()} starting...")
+
                 agent = self._agent_registry[agent_name](tier=agent_tier)
                 agent_instances[agent_name] = agent
 
+                t0 = time.monotonic()
                 try:
                     output = await agent.execute(instruction, context)
+                    agent_ms = int((time.monotonic() - t0) * 1000)
                     await self.state.save_agent_output(task_id, agent_name, output, db)
+
+                    # Emit meaningful log lines from output
+                    _emit_agent_logs(task_id, agent_name, output)
+
+                    emit_agent_completed(
+                        task_id, agent_name,
+                        f"{agent_name.capitalize()} done",
+                        latency_ms=agent_ms,
+                        cost_usd=agent.total_cost,
+                    )
                     logger.info("[pipeline] Agent %s completed (cost=$%.5f)", agent_name, agent.total_cost)
                 except Exception as exc:
                     error_msg = f"Agent '{agent_name}' failed: {exc}"
                     logger.error("[pipeline] %s", error_msg)
+                    emit_task_failed(task_id, error_msg)
                     await self.state.fail_task(task_id, error_msg, db)
                     raise RuntimeError(error_msg) from exc
 
-            # 4. Always run critic last — always free tier (evaluation, not generation)
+            # 4. Always run critic last
             logger.info("[pipeline] Running critic (tier=free)...")
+            emit_agent_started(task_id, "critic", "Critic evaluating output quality...")
+            t0 = time.monotonic()
             final_context = await self.state.get_context(task_id, db)
             try:
                 critic_output = await self._critic.execute(task, final_context)
+                critic_ms = int((time.monotonic() - t0) * 1000)
                 await self.state.save_agent_output(task_id, "critic", critic_output, db)
+                score = critic_output.get("overall_score", 0.0)
+                emit_agent_log(task_id, "critic", f"Score: {score:.1f}/10 — {critic_output.get('feedback', '')[:80]}")
+                emit_agent_completed(
+                    task_id, "critic",
+                    f"Critic done — {score:.1f}/10",
+                    latency_ms=critic_ms,
+                    cost_usd=self._critic.total_cost,
+                )
             except Exception as exc:
                 logger.warning("[pipeline] Critic failed (non-fatal): %s", exc)
-                critic_output = {
-                    "overall_score": 0.0,
-                    "feedback": "Evaluation unavailable",
-                    "emails_reviewed": 0,
-                }
+                critic_output = {"overall_score": 0.0, "feedback": "Evaluation unavailable", "emails_reviewed": 0}
 
             # 5. Compile final output
             execution_time_ms = int((time.monotonic() - start_time) * 1000)
             final_context = await self.state.get_context(task_id, db)
 
-            # Sum costs from agent gateway responses — agents track this via _total_cost
-            # (token_usage.task_id is NULL because gateway calls don't carry task_id)
             actual_cost = (
                 self._planner.total_cost
                 + self._critic.total_cost
-                + sum(
-                    agent_instances[a].total_cost
-                    for a in agents_required
-                    if a in agent_instances
-                )
+                + sum(agent_instances[a].total_cost for a in agents_required if a in agent_instances)
             )
-            # token counts: sum from token_usage by time window (best-effort)
             from sqlalchemy import text as sa_text
             token_result = await db.execute(
-                sa_text(
-                    "SELECT COALESCE(SUM(input_tokens + output_tokens), 0) "
-                    "FROM token_usage "
-                    "WHERE created_at >= :since"
-                ),
+                sa_text("SELECT COALESCE(SUM(input_tokens + output_tokens), 0) FROM token_usage WHERE created_at >= :since"),
                 {"since": task_start_dt},
             )
             actual_tokens = int(token_result.scalar() or 0)
 
             final_output = self._compile_output(
-                task=task,
-                plan=plan,
-                context=final_context,
-                critic_output=critic_output,
-                agents_used=agents_required,
+                task=task, plan=plan, context=final_context,
+                critic_output=critic_output, agents_used=agents_required,
                 execution_time_ms=execution_time_ms,
-                total_cost=actual_cost,
-                total_tokens=actual_tokens,
+                total_cost=actual_cost, total_tokens=actual_tokens,
             )
 
             # 6. Complete task
             await self.state.complete_task(
-                task_id=task_id,
-                final_output=final_output,
-                total_cost_usd=actual_cost,
-                total_tokens=actual_tokens,
-                db=db,
+                task_id=task_id, final_output=final_output,
+                total_cost_usd=actual_cost, total_tokens=actual_tokens, db=db,
             )
 
-            logger.info(
-                "[pipeline] Task %s completed in %dms",
+            emit_task_completed(
                 task_id,
-                execution_time_ms,
+                total_cost_usd=actual_cost,
+                total_tokens=actual_tokens,
+                critic_score=critic_output.get("overall_score", 0.0),
             )
+
+            logger.info("[pipeline] Task %s completed in %dms", task_id, execution_time_ms)
             return {**final_output, "task_id": task_id}
 
         except Exception as exc:
+            emit_task_failed(task_id, str(exc))
             await self.state.fail_task(task_id, str(exc), db)
             raise
 
@@ -487,6 +515,39 @@ class AgentPipeline:
             "agents_used": ["planner"] + agents_used + ["critic"],
             "execution_time_ms": execution_time_ms,
         }
+
+
+def _emit_agent_logs(task_id: str, agent_name: str, output: Dict[str, Any]) -> None:
+    """Emit meaningful log lines from agent output."""
+    from app.services.event_emitter import emit_agent_log
+    try:
+        if agent_name == "researcher":
+            companies = output.get("companies", [])
+            for c in companies[:5]:
+                name = c.get("name", "")
+                stage = c.get("funding_stage", "")
+                desc = (c.get("description") or "")[:60]
+                if name:
+                    emit_agent_log(task_id, agent_name, f"Found: {name}{' — ' + stage if stage else ''}{' — ' + desc if desc else ''}")
+        elif agent_name == "enricher":
+            enriched = output.get("enriched_companies", [])
+            for c in enriched[:5]:
+                company = c.get("company", "")
+                dm = c.get("decision_maker_name")
+                role = c.get("decision_maker_role", "")
+                if company and dm:
+                    emit_agent_log(task_id, agent_name, f"{company} → {dm} ({role})")
+                elif company:
+                    emit_agent_log(task_id, agent_name, f"{company} → no decision maker found")
+        elif agent_name == "writer":
+            emails = output.get("emails", [])
+            for e in emails[:5]:
+                company = e.get("company", "")
+                subject = e.get("subject", "")[:50]
+                if company:
+                    emit_agent_log(task_id, agent_name, f"Email for {company}: \"{subject}\"")
+    except Exception:
+        pass  # log emission is always non-fatal
 
 
 # Keep the old Pipeline class for backward compatibility with tasks.py

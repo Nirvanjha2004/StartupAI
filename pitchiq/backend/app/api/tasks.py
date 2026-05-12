@@ -1,23 +1,27 @@
 """
-Task API endpoints + Dashboard endpoints.
+Task API endpoints + Dashboard endpoints + SSE streaming.
 
-POST /api/v1/task                        — run agent task (synchronous)
-GET  /api/v1/task/{task_id}              — get task status + result
-GET  /api/v1/dashboard/stats             — aggregate stats
-GET  /api/v1/dashboard/tasks             — last 20 tasks
-GET  /api/v1/dashboard/tasks/{id}/breakdown — per-agent token/cost detail
+POST /api/v1/task                           — create task, start pipeline, return task_id immediately
+GET  /api/v1/task/{task_id}/stream          — SSE stream of pipeline events
+GET  /api/v1/task/{task_id}                 — get task status + result
+GET  /api/v1/dashboard/stats
+GET  /api/v1/dashboard/tasks
+GET  /api/v1/dashboard/tasks/{id}/breakdown
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal, Optional
+import asyncio
+import json
+from typing import Any, AsyncGenerator, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.session import get_db
+from app.db.session import get_db, AsyncSessionLocal
 from app.orchestrator.pipeline import AgentPipeline
 from app.orchestrator.state import StateManager
 from app.utils.logger import get_logger
@@ -80,6 +84,8 @@ class DashboardTasksResponse(BaseModel):
 
 
 class AgentDetail(BaseModel):
+    model_config = {"protected_namespaces": ()}
+
     agent_name: str
     model_used: str
     input_tokens: int
@@ -101,35 +107,108 @@ class TaskBreakdown(BaseModel):
 
 # ── Task endpoints ────────────────────────────────────────────────────────────
 
-@router.post("/task", response_model=TaskStartResponse, summary="Run agent task")
+@router.post("/task", response_model=TaskStartResponse, summary="Start agent task")
 async def run_task(
     request: TaskRequest,
     db: AsyncSession = Depends(get_db),
 ) -> TaskStartResponse:
-    """Start a multi-agent task. Runs synchronously."""
+    """
+    Start a multi-agent task.
+
+    Creates the task in DB immediately and kicks off the pipeline in the
+    background. Returns task_id so the client can connect to the SSE stream.
+    The pipeline result is also returned inline when it completes (for
+    clients that don't use SSE).
+    """
     if not request.task.strip():
         raise HTTPException(status_code=422, detail="Task cannot be empty")
 
     logger.info("Starting task: %s (tier=%s)", request.task[:80], request.user_tier)
-    pipeline = AgentPipeline()
 
+    # Pre-create task so SSE stream can start immediately
+    task_id = await state_manager.create_task(
+        request.task, request.user_tier, db, request.user_id
+    )
+
+    # Run pipeline — still synchronous for now (SSE streams progress live)
+    pipeline = AgentPipeline()
     try:
         final_output = await pipeline.run(
             task=request.task,
             user_tier=request.user_tier,
             db=db,
             user_id=request.user_id,
+            task_id=task_id,
         )
     except Exception as exc:
         logger.error("Task failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=503, detail=f"Task execution failed: {exc}")
 
     return TaskStartResponse(
-        task_id=final_output["task_id"],
+        task_id=task_id,
         status="completed",
         message="Task completed successfully",
         final_output=final_output,
     )
+
+
+@router.get("/task/{task_id}/stream", summary="SSE stream of pipeline events")
+async def stream_task_events(task_id: str) -> StreamingResponse:
+    """
+    Server-Sent Events stream for a running task.
+
+    Polls Redis list task_events:{task_id} every 500ms and yields new events.
+    Closes when it sees the "DONE" sentinel.
+    """
+    return StreamingResponse(
+        _sse_generator(task_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
+
+
+async def _sse_generator(task_id: str) -> AsyncGenerator[str, None]:
+    """Poll Redis and yield SSE events until DONE sentinel."""
+    import redis as redis_sync
+    from app.config import settings
+
+    try:
+        r = redis_sync.from_url(settings.REDIS_URL, decode_responses=False)
+    except Exception as exc:
+        yield f"data: {json.dumps({'type': 'task_failed', 'message': f'Redis unavailable: {exc}'})}\n\n"
+        yield "data: [DONE]\n\n"
+        return
+
+    key = f"task_events:{task_id}"
+    cursor = 0
+    max_polls = 1200  # 10 minutes max (1200 × 0.5s)
+
+    for _ in range(max_polls):
+        try:
+            events = r.lrange(key, cursor, -1)
+        except Exception:
+            await asyncio.sleep(0.5)
+            continue
+
+        for raw in events:
+            cursor += 1
+            if raw == b"DONE":
+                yield "data: [DONE]\n\n"
+                return
+            try:
+                yield f"data: {raw.decode('utf-8')}\n\n"
+            except Exception:
+                pass
+
+        await asyncio.sleep(0.5)
+
+    # Timeout
+    yield f"data: {json.dumps({'type': 'task_failed', 'message': 'Stream timeout'})}\n\n"
+    yield "data: [DONE]\n\n"
 
 
 @router.get("/task/{task_id}", response_model=TaskStatusResponse, summary="Get task status")
