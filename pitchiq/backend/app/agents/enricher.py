@@ -68,7 +68,9 @@ class EnricherAgent(BaseAgent):
 
         logger.info("[enricher] Enriching %d companies (batched)", len(companies))
 
-        # ── Step 1: One Tavily search per company (fast, parallel-ish) ──────
+        task_id = context.get("_task_id")
+
+        # ── Step 1: One Tavily search per company ────────────────────────────
         all_snippets: List[str] = []
         for company in companies:
             name = company.get("name", "")
@@ -76,6 +78,9 @@ class EnricherAgent(BaseAgent):
                 continue
             query = f"{name} founder CEO LinkedIn"
             try:
+                if task_id:
+                    from app.services.event_emitter import emit_agent_log
+                    emit_agent_log(task_id, "enricher", f"Looking up: {name}")
                 results = self._get_tavily().search(query, max_results=3)
                 for r in results.get("results", []):
                     snippet = f"[{name}] {r.get('title','')} — {r.get('content','')[:150]}"

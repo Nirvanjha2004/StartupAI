@@ -371,6 +371,16 @@ class AgentPipeline:
             agents_required: List[str] = plan.get("agents_required", [])
             agent_instructions: Dict[str, str] = plan.get("agent_instructions", {})
 
+            # Safety net: writer should almost always run — add it if planner missed it
+            # (planner sometimes skips writer when task doesn't explicitly say "email")
+            if "writer" not in agents_required and "researcher" in agents_required:
+                logger.info("[pipeline] Writer missing from plan — adding it (PitchIQ always generates emails)")
+                agents_required = agents_required + ["writer"]
+                agent_instructions["writer"] = (
+                    f"Write personalized cold outreach emails to the founders of the companies found. "
+                    f"Reference their specific work and be concise and professional."
+                )
+
             emit_plan_ready(task_id, agents_required)
             emit_agent_completed(
                 task_id, "planner",
@@ -388,6 +398,7 @@ class AgentPipeline:
 
                 instruction = str(agent_instructions.get(agent_name, task))
                 context = await self.state.get_context(task_id, db)
+                context["_task_id"] = task_id  # inject for live log emission
 
                 agent_tier = user_tier if agent_name == "writer" else "free"
 

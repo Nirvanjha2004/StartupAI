@@ -6,7 +6,7 @@ import EmailCard from '@/components/EmailCard'
 import AgentTimeline from '@/components/AgentTimeline'
 import TerminalView from '@/components/TerminalView'
 import AgentStatusPanel, { type AgentState } from '@/components/AgentStatusPanel'
-import { runTask, streamTask } from '@/lib/api'
+import { getTask, streamTask } from '@/lib/api'
 import type { TaskEvent, FinalOutput } from '@/types'
 
 type AppMode = 'idle' | 'running' | 'completed' | 'error'
@@ -85,8 +85,7 @@ export default function Home() {
   }, [])
 
   const handleDone = useCallback(() => {
-    // SSE stream closed — pipeline finished
-    // final_output comes from the POST response, already set
+    // handled inline in handleSubmit
   }, [])
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -103,20 +102,35 @@ export default function Home() {
     setErrorMsg(null)
 
     try {
-      // Start pipeline + SSE stream concurrently
-      // SSE stream starts immediately; POST completes when pipeline finishes
-      const taskPromise = runTask(task.trim(), tier)
+      // Step 1: POST to start task — returns task_id immediately (non-blocking)
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/api/v1/task`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ task: task.trim(), user_tier: tier }),
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: res.statusText }))
+        throw new Error(err.detail || `Request failed: ${res.status}`)
+      }
+      const { task_id } = await res.json()
 
-      // We don't have task_id yet — POST returns it after completion
-      // So we start SSE after getting task_id from the response
-      const result = await taskPromise
-
-      // Connect SSE (may already be done, but catches any missed events)
-      const cleanup = streamTask(result.task_id, handleEvent, handleDone)
+      // Step 2: Connect SSE immediately — pipeline is running in background
+      const cleanup = streamTask(
+        task_id,
+        handleEvent,
+        async () => {
+          // Step 3: SSE done — fetch final result
+          try {
+            const result = await getTask(task_id)
+            setFinalOutput(result.final_output)
+            setMode('completed')
+          } catch {
+            setMode('completed') // show whatever we have
+          }
+        },
+      )
       cleanupSSERef.current = cleanup
 
-      setFinalOutput(result.final_output)
-      setMode('completed')
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Something went wrong. Try again.'
       setErrorMsg(msg)

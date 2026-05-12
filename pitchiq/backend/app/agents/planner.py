@@ -27,10 +27,12 @@ Available agents (you choose which ones are needed):
 Rules:
 - Never include yourself (planner) in agents_required
 - Never include "critic" — it runs automatically after all agents
-- If nothing to research → skip researcher
-- If no emails needed → skip writer
 - agent_instructions must describe WHAT to find, not HOW (never mention Tavily, web search, or tool names)
 - Instructions must be plain search intent: e.g. "Find 4 US startups with recent Series A funding"
+- DEFAULT: always include all three agents [researcher, enricher, writer]
+- PitchIQ's purpose is cold outreach — always generate emails unless user explicitly says "no emails", "just research", "only list", or "no outreach"
+- Only skip writer if user explicitly opts out of emails
+- Only skip enricher if there are no companies to look up
 
 Return ONLY this JSON, no preamble, no markdown:
 {

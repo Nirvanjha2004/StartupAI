@@ -55,24 +55,27 @@ class ResearcherAgent(BaseAgent):
     async def execute(self, task: str, context: Dict[str, Any]) -> Dict[str, Any]:
         """
         Run targeted searches and return structured company data.
-
-        Args:
-            task:    Researcher instruction from planner.
-            context: Previous agent outputs (unused for researcher).
-
-        Returns:
-            Dict with 'companies' list and 'raw_summary'.
         """
         logger.info("[researcher] Task: %s", task[:80])
 
-        # Generate 2-3 search queries from the instruction
-        queries = self._build_queries(task)
-        logger.info("[researcher] Running %d searches: %s", len(queries), queries)
+        # Extract requested count from instruction (e.g. "find 3 startups" → 3)
+        import re as _re
+        count_match = _re.search(r'\b(\d+)\b', task)
+        requested_count = int(count_match.group(1)) if count_match else 5
+        requested_count = max(1, min(requested_count, 10))  # clamp 1-10
 
-        # Run searches
+        queries = self._build_queries(task)
+        logger.info("[researcher] Running %d searches (want %d companies): %s", len(queries), requested_count, queries)
+
+        # Emit live search events if task_id available via context
+        task_id = context.get("_task_id")
+
         all_results: List[str] = []
         for query in queries:
             try:
+                if task_id:
+                    from app.services.event_emitter import emit_agent_log
+                    emit_agent_log(task_id, "researcher", f"Searching: {query[:60]}")
                 results = self._get_tavily().search(query, max_results=5)
                 for r in results.get("results", []):
                     snippet = f"[{r.get('title', '')}] {r.get('content', '')[:300]} (source: {r.get('url', '')})"
@@ -83,19 +86,16 @@ class ResearcherAgent(BaseAgent):
 
         if not all_results:
             logger.warning("[researcher] No search results found")
-            return {
-                "companies": [],
-                "raw_summary": "No results found for the given research task.",
-            }
+            return {"companies": [], "raw_summary": "No results found for the given research task."}
 
-        # Summarize with gateway
-        combined = "\n\n".join(all_results[:15])  # Cap to avoid token overflow
+        combined = "\n\n".join(all_results[:15])
         prompt = f"""Research instruction: {task}
+Requested number of companies: {requested_count}
 
 Search results:
 {combined}
 
-Extract structured company information from these results."""
+Extract exactly {requested_count} companies (or fewer if not enough found). Do NOT include more than {requested_count}."""
 
         messages = [
             {"role": "system", "content": _SUMMARIZE_PROMPT},
@@ -105,11 +105,11 @@ Extract structured company information from these results."""
         gw = await self._call_gateway(prompt=prompt, messages=messages)
         output = self._parse_output(gw.response)
 
-        logger.info(
-            "[researcher] Found %d companies, summary: %s",
-            len(output.get("companies", [])),
-            output.get("raw_summary", "")[:60],
-        )
+        # Hard cap to requested count
+        if len(output.get("companies", [])) > requested_count:
+            output["companies"] = output["companies"][:requested_count]
+
+        logger.info("[researcher] Found %d companies (requested %d)", len(output.get("companies", [])), requested_count)
         return output
 
     def _build_queries(self, instruction: str) -> List[str]:

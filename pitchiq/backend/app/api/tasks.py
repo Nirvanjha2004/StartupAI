@@ -115,41 +115,57 @@ async def run_task(
     """
     Start a multi-agent task.
 
-    Creates the task in DB immediately and kicks off the pipeline in the
-    background. Returns task_id so the client can connect to the SSE stream.
-    The pipeline result is also returned inline when it completes (for
-    clients that don't use SSE).
+    Creates task_id immediately and returns it, then runs the pipeline
+    in a background asyncio task. Client should connect to SSE stream
+    right after receiving task_id to get live events.
     """
     if not request.task.strip():
         raise HTTPException(status_code=422, detail="Task cannot be empty")
 
     logger.info("Starting task: %s (tier=%s)", request.task[:80], request.user_tier)
 
-    # Pre-create task so SSE stream can start immediately
+    # Pre-create task so client gets task_id immediately
     task_id = await state_manager.create_task(
         request.task, request.user_tier, db, request.user_id
     )
 
-    # Run pipeline — still synchronous for now (SSE streams progress live)
-    pipeline = AgentPipeline()
-    try:
-        final_output = await pipeline.run(
+    # Run pipeline in background — SSE stream will carry live events
+    asyncio.create_task(
+        _run_pipeline_background(
             task=request.task,
             user_tier=request.user_tier,
-            db=db,
             user_id=request.user_id,
             task_id=task_id,
         )
-    except Exception as exc:
-        logger.error("Task failed: %s", exc, exc_info=True)
-        raise HTTPException(status_code=503, detail=f"Task execution failed: {exc}")
+    )
 
     return TaskStartResponse(
         task_id=task_id,
-        status="completed",
-        message="Task completed successfully",
-        final_output=final_output,
+        status="pending",
+        message="Task started. Connect to SSE stream for live updates.",
+        final_output=None,
     )
+
+
+async def _run_pipeline_background(
+    task: str,
+    user_tier: str,
+    user_id: Optional[str],
+    task_id: str,
+) -> None:
+    """Run the pipeline in a background task with its own DB session."""
+    async with AsyncSessionLocal() as db:
+        try:
+            pipeline = AgentPipeline()
+            await pipeline.run(
+                task=task,
+                user_tier=user_tier,
+                db=db,
+                user_id=user_id,
+                task_id=task_id,
+            )
+        except Exception as exc:
+            logger.error("Background pipeline failed for task %s: %s", task_id, exc)
 
 
 @router.get("/task/{task_id}/stream", summary="SSE stream of pipeline events")
