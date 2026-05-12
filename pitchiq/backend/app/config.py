@@ -43,8 +43,8 @@ class Settings(BaseSettings):
     # FREE tier: always 1 iteration (single-pass, no critic loop)
     # PREMIUM tier: up to MAX_CRITIC_ITERATIONS, exits early if score >= threshold
     FREE_CRITIC_ITERATIONS: int = 1
-    MAX_CRITIC_ITERATIONS: int = 5
-    PREMIUM_QUALITY_THRESHOLD: float = 8.5
+    MAX_CRITIC_ITERATIONS: int = 3       # was 5 — 3 is enough, saves ~40s
+    PREMIUM_QUALITY_THRESHOLD: float = 7.5  # was 8.5 — realistic for Groq self-eval
 
     class Config:
         env_file = ".env"
