@@ -425,7 +425,12 @@ class AgentPipeline:
                 context = await self.state.get_context(task_id, db)
                 context["_task_id"] = task_id  # inject for live log emission
 
-                agent_tier = user_tier if agent_name == "writer" else "agent"
+                # All agents use "agent" tier → agent_direct strategy (no critic loop,
+                # no cache). The orchestrator's CriticAgent handles quality at the end.
+                # Previously writer used user_tier="premium" which triggered up to 3
+                # gateway-level critic iterations per call — and those could restart if
+                # the HTTP retry in _call_gateway fired, causing a fresh iteration set.
+                agent_tier = "agent"
 
                 logger.info("[pipeline] Running agent: %s (tier=%s)", agent_name, agent_tier)
                 emit_agent_started(task_id, agent_name, f"{agent_name.capitalize()} starting...")

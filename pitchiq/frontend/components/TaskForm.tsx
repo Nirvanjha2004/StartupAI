@@ -1,8 +1,10 @@
 'use client'
 
 import { useState } from 'react'
+import { ArrowRight } from 'lucide-react'
 import { runTask } from '@/lib/api'
 import type { TaskResponse } from '@/types'
+import { Spinner } from '@/components/ui/Spinner'
 
 interface TaskFormProps {
   onResult: (result: TaskResponse) => void
@@ -34,69 +36,60 @@ export default function TaskForm({ onResult, onLoading, loading }: TaskFormProps
   }
 
   return (
-    <form onSubmit={handleSubmit} className="w-full space-y-4">
-      {/* Textarea */}
+    <form onSubmit={handleSubmit} className="w-full space-y-3">
       <textarea
         value={task}
         onChange={(e) => setTask(e.target.value)}
         disabled={loading}
         rows={3}
         placeholder="Find 3 YC startups solving logistics in India and write cold emails to their founders"
-        className="w-full bg-[#1a1a1a] border border-[#2a2a2a] rounded-xl px-4 py-3 text-white placeholder-[#555] text-base resize-none focus:outline-none focus:border-[#444] disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+        className="w-full bg-[#111] border border-white/[0.08] rounded-2xl px-4 py-3.5 text-zinc-100 placeholder-zinc-600 text-sm resize-none focus:outline-none focus:border-white/[0.16] focus:bg-[#141414] disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200 leading-relaxed"
+        style={{ boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.03)' }}
       />
 
-      {/* Tier + Submit row */}
-      <div className="flex items-center gap-3">
+      <div className="flex items-center gap-2.5">
         {/* Tier toggle */}
-        <div className="flex rounded-lg overflow-hidden border border-[#2a2a2a]">
-          <button
-            type="button"
-            onClick={() => setTier('free')}
-            className={`px-4 py-2 text-sm font-medium transition-colors ${
-              tier === 'free'
-                ? 'bg-[#2a2a2a] text-white'
-                : 'bg-transparent text-[#666] hover:text-[#999]'
-            }`}
-          >
-            Free
-          </button>
-          <button
-            type="button"
-            onClick={() => setTier('premium')}
-            className={`px-4 py-2 text-sm font-medium transition-colors ${
-              tier === 'premium'
-                ? 'bg-[#2a2a2a] text-white'
-                : 'bg-transparent text-[#666] hover:text-[#999]'
-            }`}
-          >
-            Premium
-          </button>
+        <div className="flex rounded-xl overflow-hidden border border-white/[0.08] bg-[#111] p-0.5 gap-0.5">
+          {(['free', 'premium'] as const).map((t) => (
+            <button
+              key={t}
+              type="button"
+              onClick={() => setTier(t)}
+              className={`px-3.5 py-1.5 text-xs font-medium capitalize rounded-lg transition-all duration-150 ${
+                tier === t
+                  ? t === 'premium'
+                    ? 'bg-amber-500/15 text-amber-400 border border-amber-500/25'
+                    : 'bg-white/[0.08] text-zinc-200 border border-white/[0.10]'
+                  : 'text-zinc-600 hover:text-zinc-400'
+              }`}
+            >
+              {t === 'premium' && <span className="mr-1">✦</span>}
+              {t}
+            </button>
+          ))}
         </div>
 
-        {/* Submit */}
         <button
           type="submit"
           disabled={loading || !task.trim()}
-          className={`flex-1 py-2 px-6 rounded-lg font-medium text-sm transition-all ${
-            loading
-              ? 'bg-[#1a1a1a] border border-[#2a2a2a] text-[#666] cursor-not-allowed'
-              : 'bg-white text-black hover:bg-[#e5e5e5] disabled:opacity-40 disabled:cursor-not-allowed'
-          }`}
+          className="flex-1 btn btn-primary flex items-center justify-center gap-2 py-2.5 rounded-xl font-semibold text-sm"
         >
           {loading ? (
-            <span className="flex items-center justify-center gap-2">
-              <span className="inline-block w-3 h-3 rounded-full border-2 border-[#444] border-t-[#888] animate-spin" />
-              Running...
-            </span>
+            <>
+              <Spinner size="xs" />
+              Running…
+            </>
           ) : (
-            'Run PitchIQ →'
+            <>
+              Run PitchIQ
+              <ArrowRight className="w-4 h-4" />
+            </>
           )}
         </button>
       </div>
 
-      {/* Error */}
       {error && (
-        <p className="text-red-400 text-sm">{error}</p>
+        <p className="text-red-400 text-xs">{error}</p>
       )}
     </form>
   )

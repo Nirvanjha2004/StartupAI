@@ -21,9 +21,12 @@ def route(user_tier: str) -> RouteDecision:
     Return the inference strategy and model for the given tier.
 
     free    → single_pass    Groq, 1 LLM call + 1 critic + cache
-    premium → iterative      Groq/Claude, up to 5 critic loops + cache
+    premium → iterative      Groq/Claude, up to MAX_CRITIC_ITERATIONS loops + cache
     agent   → agent_direct   Groq, 1 LLM call only — NO critic, NO cache
-                             Used by all agents except writer to cut latency ~50%
+                             Used by ALL agents (planner, researcher, enricher, writer).
+                             Quality is handled by the orchestrator's CriticAgent, not
+                             the gateway loop. Using "premium" tier for writer caused
+                             the iteration loop to restart on each HTTP retry.
     """
     if user_tier == "premium":
         return RouteDecision(strategy="iterative", model=settings.PREMIUM_MODEL)

@@ -1,4 +1,5 @@
 import AgentStatusRow, { type AgentStatus } from './AgentStatusRow'
+import { Cpu, Coins, Timer } from 'lucide-react'
 
 export interface AgentState {
   name: string
@@ -18,48 +19,73 @@ interface AgentStatusPanelProps {
 }
 
 export default function AgentStatusPanel({ agents, stats }: AgentStatusPanelProps) {
+  const doneCount = agents.filter((a) => a.status === 'done').length
+  const totalCount = agents.length
+  const progress = totalCount > 0 ? (doneCount / totalCount) * 100 : 0
+
   return (
-    <div className="bg-[#111] border border-zinc-800 rounded-lg p-4 space-y-4 h-fit">
+    <div className="surface-card p-4 space-y-5 h-fit">
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <p className="text-zinc-500 text-[11px] uppercase tracking-widest font-medium">Agents</p>
+        <span className="text-zinc-600 text-xs font-mono">{doneCount}/{totalCount}</span>
+      </div>
+
+      {/* Progress bar */}
+      <div className="h-1 bg-white/[0.05] rounded-full overflow-hidden -mt-2">
+        <div
+          className="h-full bg-emerald-500 rounded-full transition-all duration-500 ease-out"
+          style={{ width: `${progress}%` }}
+        />
+      </div>
+
       {/* Agent list */}
-      <div>
-        <p className="text-zinc-500 text-xs uppercase tracking-wider mb-2">Agents</p>
-        <div className="divide-y divide-zinc-800/50">
-          {agents.map((agent) => (
-            <AgentStatusRow
-              key={agent.name}
-              name={agent.name}
-              status={agent.status}
-              latencyMs={agent.latencyMs}
-            />
-          ))}
-        </div>
+      <div className="divide-y divide-white/[0.04]">
+        {agents.map((agent) => (
+          <AgentStatusRow
+            key={agent.name}
+            name={agent.name}
+            status={agent.status}
+            latencyMs={agent.latencyMs}
+          />
+        ))}
       </div>
 
       {/* Divider */}
-      <div className="border-t border-zinc-800" />
+      <div className="border-t border-white/[0.05]" />
 
       {/* Live stats */}
-      <div>
-        <p className="text-zinc-500 text-xs uppercase tracking-wider mb-3">Live Stats</p>
-        <div className="space-y-2">
-          <div className="flex justify-between">
-            <span className="text-zinc-500 text-xs font-mono">Tokens used</span>
-            <span className="text-zinc-300 text-xs font-mono">
-              {stats.tokens.toLocaleString()}
-            </span>
-          </div>
-          <div className="flex justify-between">
-            <span className="text-zinc-500 text-xs font-mono">Cost so far</span>
-            <span className="text-zinc-300 text-xs font-mono">
-              ${stats.costUsd.toFixed(4)}
-            </span>
-          </div>
-          <div className="flex justify-between">
-            <span className="text-zinc-500 text-xs font-mono">Elapsed</span>
-            <span className="text-zinc-300 text-xs font-mono">
-              {(stats.elapsedMs / 1000).toFixed(1)}s
-            </span>
-          </div>
+      <div className="space-y-1">
+        <p className="text-zinc-500 text-[11px] uppercase tracking-widest font-medium mb-3">Live Stats</p>
+
+        <div className="flex items-center justify-between py-1.5">
+          <span className="flex items-center gap-2 text-zinc-600 text-xs">
+            <Cpu className="w-3 h-3" />
+            Tokens
+          </span>
+          <span className="text-zinc-300 text-xs font-mono tabular-nums">
+            {stats.tokens.toLocaleString()}
+          </span>
+        </div>
+
+        <div className="flex items-center justify-between py-1.5">
+          <span className="flex items-center gap-2 text-zinc-600 text-xs">
+            <Coins className="w-3 h-3" />
+            Cost
+          </span>
+          <span className="text-zinc-300 text-xs font-mono tabular-nums">
+            ${stats.costUsd.toFixed(4)}
+          </span>
+        </div>
+
+        <div className="flex items-center justify-between py-1.5">
+          <span className="flex items-center gap-2 text-zinc-600 text-xs">
+            <Timer className="w-3 h-3" />
+            Elapsed
+          </span>
+          <span className="text-zinc-300 text-xs font-mono tabular-nums">
+            {(stats.elapsedMs / 1000).toFixed(1)}s
+          </span>
         </div>
       </div>
     </div>

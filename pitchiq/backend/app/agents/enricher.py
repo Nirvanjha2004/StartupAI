@@ -3,13 +3,19 @@ Enricher Agent — finds decision maker info for each company.
 
 Batches all companies into ONE Tavily search + ONE gateway call
 instead of N calls (one per company). This cuts enricher time from
-N×20s to ~40s total regardless of company count.
+N×20s to ~10s total regardless of company count.
+
+Key optimisation: Tavily searches run concurrently via asyncio.gather,
+not sequentially. 10 companies × 3 results used to take ~60s serially;
+concurrent execution brings it down to the latency of the slowest single
+search (~3-6s).
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from app.agents.base import BaseAgent
 from app.config import settings
@@ -66,34 +72,17 @@ class EnricherAgent(BaseAgent):
             logger.warning("[enricher] No companies to enrich")
             return {"enriched_companies": []}
 
-        logger.info("[enricher] Enriching %d companies (batched)", len(companies))
+        logger.info("[enricher] Enriching %d companies (concurrent Tavily searches)", len(companies))
 
         task_id = context.get("_task_id")
 
-        # ── Step 1: One Tavily search per company ────────────────────────────
-        all_snippets: List[str] = []
-        for company in companies:
-            name = company.get("name", "")
-            if not name:
-                continue
-            query = f"{name} founder CEO LinkedIn"
-            try:
-                if task_id:
-                    from app.services.event_emitter import emit_agent_log
-                    emit_agent_log(task_id, "enricher", f"Looking up: {name}")
-                results = self._get_tavily().search(query, max_results=3)
-                for r in results.get("results", []):
-                    snippet = f"[{name}] {r.get('title','')} — {r.get('content','')[:150]}"
-                    all_snippets.append(snippet)
-            except Exception as exc:
-                logger.warning("[enricher] Search failed for %s: %s", name, exc)
+        # ── Step 1: All Tavily searches run concurrently ─────────────────────
+        all_snippets = await self._search_all_companies(companies, task_id)
 
         if not all_snippets:
             logger.warning("[enricher] No search results, returning companies without enrichment")
             return {
-                "enriched_companies": [
-                    self._empty_enriched(c) for c in companies
-                ]
+                "enriched_companies": [self._empty_enriched(c) for c in companies]
             }
 
         # ── Step 2: ONE gateway call to extract all decision makers ──────────
@@ -139,6 +128,43 @@ class EnricherAgent(BaseAgent):
 
         logger.info("[enricher] Enriched %d companies", len(enriched))
         return {"enriched_companies": enriched}
+
+    async def _search_company(
+        self, name: str, task_id: Optional[str]
+    ) -> List[str]:
+        """Run a single Tavily search for one company. Returns snippet strings."""
+        query = f"{name} founder CEO LinkedIn"
+        try:
+            if task_id:
+                from app.services.event_emitter import emit_agent_log
+                emit_agent_log(task_id, "enricher", f"Looking up: {name}")
+            # Tavily client is sync — run in thread pool to avoid blocking the event loop
+            loop = asyncio.get_event_loop()
+            results = await loop.run_in_executor(
+                None,
+                lambda: self._get_tavily().search(query, max_results=3),
+            )
+            snippets = []
+            for r in results.get("results", []):
+                snippet = f"[{name}] {r.get('title', '')} — {r.get('content', '')[:150]}"
+                snippets.append(snippet)
+            return snippets
+        except Exception as exc:
+            logger.warning("[enricher] Search failed for %s: %s", name, exc)
+            return []
+
+    async def _search_all_companies(
+        self, companies: List[Dict], task_id: Optional[str]
+    ) -> List[str]:
+        """Run all company searches concurrently and flatten results."""
+        tasks = [
+            self._search_company(c.get("name", ""), task_id)
+            for c in companies
+            if c.get("name")
+        ]
+        results: List[List[str]] = await asyncio.gather(*tasks)
+        # Flatten
+        return [snippet for company_snippets in results for snippet in company_snippets]
 
     def _parse_batch(
         self, raw: str, companies: List[Dict]

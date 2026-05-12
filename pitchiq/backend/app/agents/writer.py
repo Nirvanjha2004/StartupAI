@@ -90,7 +90,6 @@ Write one personalized cold email for each company above."""
         except Exception as exc:
             logger.warning("[writer] Batch gateway call failed: %s", exc)
             emails = []
-
         logger.info("[writer] Generated %d emails", len(emails))
         return {"emails": emails}
 
@@ -139,41 +138,68 @@ Write one personalized cold email for each company above."""
     def _parse_emails(
         self, raw: str, companies: List[Dict]
     ) -> List[Dict[str, Any]]:
-        """Parse JSON — handles array, single object, or array of objects."""
+        """Parse JSON — handles array, single object, wrapped object, or partial arrays."""
         text = raw.strip()
+
+        # Strip markdown code fences
         if text.startswith("```"):
             lines = text.split("\n")
             text = "\n".join(lines[1:-1]) if len(lines) > 2 else text
+            text = text.strip()
 
         def extract_emails(data: Any) -> List[Dict]:
             """Normalize any parsed structure into a list of email dicts."""
             if isinstance(data, list):
                 return [e for e in data if isinstance(e, dict) and "body" in e]
-            if isinstance(data, dict) and "body" in data:
-                return [data]  # single object — wrap in list
+            if isinstance(data, dict):
+                # Unwrap {"emails": [...]} or {"data": [...]} wrappers
+                for key in ("emails", "data", "results", "output"):
+                    if key in data and isinstance(data[key], list):
+                        return [e for e in data[key] if isinstance(e, dict) and "body" in e]
+                # Single email object
+                if "body" in data:
+                    return [data]
             return []
 
-        # Try strict parse
+        # 1. Strict parse
         try:
-            data = json.loads(text)
-            result = extract_emails(data)
+            result = extract_emails(json.loads(text))
             if result:
                 return result
         except (json.JSONDecodeError, ValueError):
             pass
 
-        # Try cleaning control characters
+        # 2. Strip control characters and retry
         try:
+            import re
             cleaned = re.sub(r'[\x00-\x1f\x7f]', lambda m: repr(m.group())[1:-1], text)
-            data = json.loads(cleaned)
-            result = extract_emails(data)
+            result = extract_emails(json.loads(cleaned))
             if result:
                 return result
         except (json.JSONDecodeError, ValueError):
             pass
 
-        # Last resort: extract all JSON objects from the text
+        # 3. Find the outermost JSON array or object in the text
         try:
+            import re
+            # Try to find a JSON array first
+            arr_match = re.search(r'\[[\s\S]*\]', text)
+            if arr_match:
+                result = extract_emails(json.loads(arr_match.group()))
+                if result:
+                    return result
+            # Then try a JSON object
+            obj_match = re.search(r'\{[\s\S]*\}', text)
+            if obj_match:
+                result = extract_emails(json.loads(obj_match.group()))
+                if result:
+                    return result
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        # 4. Last resort: extract individual JSON objects that contain "body"
+        try:
+            import re
             objects = re.findall(r'\{[^{}]*"body"[^{}]*\}', text, re.DOTALL)
             emails = []
             for obj in objects:
@@ -188,5 +214,8 @@ Write one personalized cold email for each company above."""
         except Exception:
             pass
 
-        logger.warning("[writer] Could not parse email JSON, returning empty")
+        logger.warning(
+            "[writer] Could not parse email JSON. Raw response (first 500 chars): %s",
+            raw[:500],
+        )
         return []

@@ -13,47 +13,57 @@ function formatTime(iso: string): string {
   }
 }
 
+const AGENT_COLORS: Record<string, string> = {
+  planner:    '#a78bfa',
+  researcher: '#60a5fa',
+  enricher:   '#34d399',
+  writer:     '#f59e0b',
+  critic:     '#f472b6',
+}
+
 function agentColor(agent: string): string {
-  const colors: Record<string, string> = {
-    planner: '#a78bfa',    // violet
-    researcher: '#60a5fa', // blue
-    enricher: '#34d399',   // emerald
-    writer: '#f59e0b',     // amber
-    critic: '#f472b6',     // pink
-  }
-  return colors[agent.toLowerCase()] || '#71717a'
+  return AGENT_COLORS[agent?.toLowerCase()] || '#71717a'
 }
 
 export default function TerminalLine({ event }: TerminalLineProps) {
   const time = formatTime(event.timestamp)
   const agent = event.agent
 
-  // Color by event type
+  const timeEl = (
+    <span className="text-zinc-700 text-[11px] shrink-0 tabular-nums select-none">{time}</span>
+  )
+
   if (event.type === 'task_started') {
     return (
-      <div className="flex items-start gap-2 py-0.5">
-        <span className="text-zinc-600 text-xs shrink-0 font-mono">{time}</span>
-        <span className="text-zinc-400 font-mono text-sm">▶ {event.message}</span>
+      <div className="flex items-start gap-2.5 py-0.5">
+        {timeEl}
+        <span className="text-zinc-400 text-sm">
+          <span className="text-zinc-600 mr-1.5">▶</span>
+          {event.message}
+        </span>
       </div>
     )
   }
 
   if (event.type === 'plan_ready') {
     return (
-      <div className="flex items-start gap-2 py-0.5">
-        <span className="text-zinc-600 text-xs shrink-0 font-mono">{time}</span>
-        <span className="text-zinc-400 font-mono text-sm">◆ {event.message}</span>
+      <div className="flex items-start gap-2.5 py-0.5">
+        {timeEl}
+        <span className="text-zinc-400 text-sm">
+          <span className="text-violet-400 mr-1.5">◆</span>
+          {event.message}
+        </span>
       </div>
     )
   }
 
   if (event.type === 'agent_started') {
     return (
-      <div className="flex items-start gap-2 py-0.5 mt-1">
-        <span className="text-zinc-600 text-xs shrink-0 font-mono">{time}</span>
-        <span className="font-mono text-sm">
-          <span style={{ color: agentColor(agent || '') }}>[{agent}]</span>
-          <span className="text-blue-400"> {event.message}</span>
+      <div className="flex items-start gap-2.5 py-0.5 mt-1">
+        {timeEl}
+        <span className="text-sm">
+          <span style={{ color: agentColor(agent || '') }} className="font-medium">[{agent}]</span>
+          <span className="text-blue-400 ml-1.5">{event.message}</span>
         </span>
       </div>
     )
@@ -61,11 +71,11 @@ export default function TerminalLine({ event }: TerminalLineProps) {
 
   if (event.type === 'agent_log') {
     return (
-      <div className="flex items-start gap-2 py-0.5">
-        <span className="text-zinc-600 text-xs shrink-0 font-mono">{time}</span>
-        <span className="font-mono text-sm">
-          <span style={{ color: agentColor(agent || '') }} className="opacity-60">[{agent}]</span>
-          <span className="text-zinc-200"> {event.message}</span>
+      <div className="flex items-start gap-2.5 py-0.5">
+        {timeEl}
+        <span className="text-sm">
+          <span style={{ color: agentColor(agent || ''), opacity: 0.5 }}>[{agent}]</span>
+          <span className="text-zinc-300 ml-1.5">{event.message}</span>
         </span>
       </div>
     )
@@ -73,14 +83,14 @@ export default function TerminalLine({ event }: TerminalLineProps) {
 
   if (event.type === 'agent_completed') {
     const latency = event.latency_ms ? ` ${(event.latency_ms / 1000).toFixed(1)}s` : ''
-    const cost = event.cost_usd ? ` $${event.cost_usd.toFixed(4)}` : ''
+    const cost = event.cost_usd ? ` · $${event.cost_usd.toFixed(4)}` : ''
     return (
-      <div className="flex items-start gap-2 py-0.5">
-        <span className="text-zinc-600 text-xs shrink-0 font-mono">{time}</span>
-        <span className="font-mono text-sm">
-          <span style={{ color: agentColor(agent || '') }}>[{agent}]</span>
-          <span className="text-green-400"> ✓ {event.message}</span>
-          <span className="text-zinc-600 text-xs">{latency}{cost}</span>
+      <div className="flex items-start gap-2.5 py-0.5">
+        {timeEl}
+        <span className="text-sm">
+          <span style={{ color: agentColor(agent || '') }} className="font-medium">[{agent}]</span>
+          <span className="text-emerald-400 ml-1.5">✓ {event.message}</span>
+          <span className="text-zinc-600 text-[11px] ml-1.5 tabular-nums">{latency}{cost}</span>
         </span>
       </div>
     )
@@ -88,18 +98,18 @@ export default function TerminalLine({ event }: TerminalLineProps) {
 
   if (event.type === 'task_completed') {
     return (
-      <div className="flex items-start gap-2 py-0.5 mt-2">
-        <span className="text-zinc-600 text-xs shrink-0 font-mono">{time}</span>
-        <span className="text-green-400 font-mono text-sm font-medium">✓ {event.message}</span>
+      <div className="flex items-start gap-2.5 py-0.5 mt-2">
+        {timeEl}
+        <span className="text-emerald-400 text-sm font-medium">✓ {event.message}</span>
       </div>
     )
   }
 
   if (event.type === 'task_failed') {
     return (
-      <div className="flex items-start gap-2 py-0.5">
-        <span className="text-zinc-600 text-xs shrink-0 font-mono">{time}</span>
-        <span className="text-red-400 font-mono text-sm">✗ {event.message}</span>
+      <div className="flex items-start gap-2.5 py-0.5">
+        {timeEl}
+        <span className="text-red-400 text-sm">✗ {event.message}</span>
       </div>
     )
   }
