@@ -1,52 +1,102 @@
-# PitchIQ — LLM Inference Gateway
+# PitchIQ
 
-Multi-agent cold outreach system with a tiered LLM inference gateway. Every agent in the system calls the LLM through this gateway, never directly.
+AI-powered cold outreach. Describe your target companies — PitchIQ researches them, finds decision makers, and writes personalized emails. Automatically.
+
+---
+
+## What it does
+
+You type something like:
+
+> *"Find 5 AI infrastructure startups that raised in 2024 and write cold emails to their CTOs"*
+
+PitchIQ spins up a multi-agent pipeline that:
+
+1. **Plans** — breaks the task into agent steps
+2. **Researches** — runs targeted web searches via Tavily
+3. **Enriches** — finds decision maker names and context (concurrent searches)
+4. **Writes** — generates personalized cold emails for every company
+5. **Critiques** — scores the output quality (0–10) and gives feedback
+
+Everything streams live to the UI via SSE. Results include copy-ready emails, a quality score, cost breakdown, and per-agent latency.
 
 ---
 
 ## Architecture
 
-### Two-Tier Inference Pipeline
-
-**FREE tier:**
-1. Check semantic cache (pgvector cosine similarity > 0.92)
-2. If cache miss → call Groq `llama-3.1-8b-instant`
-3. Run critic once (Groq, cheap model)
-4. Return response + quality_score regardless of score
-5. Store in cache
-
-**PREMIUM tier:**
-1. Check semantic cache
-2. If cache miss → call Claude Sonnet `claude-sonnet-4-20250514`
-3. Run critic (Groq)
-4. If score >= 8.5 → return
-5. If score < 8.5 → append feedback, rewrite with Claude
-6. Repeat until score >= 8.5 OR max 5 iterations
-7. Return best response with iteration count
-8. Store in cache
-
-### Critic Format
-
-The critic always receives the original prompt + current response and must reply in strict JSON:
-
-```json
-{"score": 8.2, "feedback": "Improve the call-to-action clarity"}
+```
+┌─────────────────────────────────────────────────────────┐
+│                     Next.js Frontend                     │
+│  Home (task runner) · Dashboard · Results               │
+└────────────────────────┬────────────────────────────────┘
+                         │ HTTP + SSE
+┌────────────────────────▼────────────────────────────────┐
+│                    FastAPI Backend                        │
+│                                                          │
+│  POST /api/v1/task          ← start pipeline            │
+│  GET  /api/v1/task/:id/stream ← SSE live events         │
+│  GET  /api/v1/task/:id      ← fetch final result        │
+│  GET  /api/v1/dashboard/*   ← stats + history           │
+│                                                          │
+│  ┌─────────────────────────────────────────────────┐    │
+│  │              Agent Orchestrator                  │    │
+│  │  Planner → Researcher → Enricher → Writer        │    │
+│  │                                    ↓             │    │
+│  │                                  Critic          │    │
+│  └──────────────────┬──────────────────────────────┘    │
+│                     │                                    │
+│  ┌──────────────────▼──────────────────────────────┐    │
+│  │           LLM Inference Gateway                  │    │
+│  │  free  → single-pass Groq + critic               │    │
+│  │  premium → iterative Groq/Claude (max 3 rounds)  │    │
+│  │  agent → direct Groq, no critic, no cache        │    │
+│  └──────────────────┬──────────────────────────────┘    │
+│                     │                                    │
+│  ┌──────────────────▼──────────────────────────────┐    │
+│  │  Semantic Cache (pgvector cosine sim > 0.92)     │    │
+│  └─────────────────────────────────────────────────┘    │
+└──────────────────────────────────────────────────────────┘
+         │                              │
+   Supabase (Postgres + pgvector)   Upstash (Redis)
+   · prompt_cache                   · SSE event queue
+   · agent_tasks                    · rate limiting
+   · token_usage
 ```
 
-Critic model: `groq/llama-3.1-8b-instant` (cheap evaluation)
+### Tier routing
+
+| Tier | Strategy | Model | Critic loop |
+|------|----------|-------|-------------|
+| `free` | single-pass | `llama-3.1-8b-instant` | 1× (score shown, doesn't gate) |
+| `premium` | iterative | `llama-3.1-8b-instant` (or Claude) | up to 3×, exits early at score ≥ 7.5 |
+| `agent` | direct | `llama-3.1-8b-instant` | none — used by all pipeline agents |
+
+All agents use the `agent` tier internally. The gateway-level critic loop is reserved for direct API calls, not the orchestrator pipeline (which has its own CriticAgent at the end).
 
 ---
 
 ## Tech Stack
 
-- **FastAPI** — async Python web framework
-- **PostgreSQL 15** with **pgvector** extension — semantic cache
-- **Redis 7** — rate limiting (future)
-- **Anthropic API** — Claude Sonnet (quality model)
-- **Groq API** — Llama 3.1 8B Instant (cheap model + critic)
-- **Jina AI API** — `jina-embeddings-v3` embeddings (1024-dim, no local model needed)
-- **asyncpg** — async PostgreSQL driver
-- **Alembic** — database migrations
+**Backend**
+- [FastAPI](https://fastapi.tiangolo.com/) + [uvicorn](https://www.uvicorn.org/) — async Python API
+- [SQLAlchemy 2](https://www.sqlalchemy.org/) + [asyncpg](https://github.com/MagicStack/asyncpg) — async Postgres
+- [Alembic](https://alembic.sqlalchemy.org/) — database migrations
+- [Groq](https://console.groq.com/) — `llama-3.1-8b-instant` (fast, cheap)
+- [Anthropic](https://console.anthropic.com/) — `claude-sonnet-4-20250514` (premium quality)
+- [Tavily](https://tavily.com/) — web search API for researcher + enricher agents
+- [Jina AI](https://jina.ai/) — `jina-embeddings-v3` (1024-dim) for semantic cache
+- [Redis](https://redis.io/) — SSE event queue + rate limiting
+
+**Frontend**
+- [Next.js 14](https://nextjs.org/) (App Router)
+- [Tailwind CSS](https://tailwindcss.com/)
+- [Framer Motion](https://www.framer.com/motion/) — animations
+- [Lucide React](https://lucide.dev/) — icons
+
+**Infrastructure**
+- [Supabase](https://supabase.com/) — managed Postgres with pgvector
+- [Upstash](https://upstash.com/) — serverless Redis (TLS)
+- Docker — backend container
 
 ---
 
@@ -56,34 +106,55 @@ Critic model: `groq/llama-3.1-8b-instant` (cheap evaluation)
 pitchiq/
 ├── backend/
 │   ├── app/
+│   │   ├── agents/
+│   │   │   ├── base.py           # BaseAgent — all LLM calls go through gateway
+│   │   │   ├── planner.py        # Breaks task into agent steps + instructions
+│   │   │   ├── researcher.py     # Tavily web search → structured company data
+│   │   │   ├── enricher.py       # Concurrent Tavily lookups → decision makers
+│   │   │   ├── writer.py         # Batched cold email generation
+│   │   │   └── critic.py         # Scores output quality 0–10
 │   │   ├── api/
-│   │   │   └── gateway.py          # POST /api/v1/chat endpoint
+│   │   │   ├── tasks.py          # Task endpoints + SSE stream + dashboard
+│   │   │   ├── gateway.py        # POST /api/v1/chat (direct gateway access)
+│   │   │   └── auth.py           # Auth stubs
 │   │   ├── db/
-│   │   │   ├── models.py           # SQLAlchemy ORM models
-│   │   │   ├── session.py          # Async DB session
-│   │   │   └── migrations/         # Alembic migrations
+│   │   │   ├── models.py         # SQLAlchemy ORM models
+│   │   │   ├── session.py        # Async engine + session factory
+│   │   │   └── migrations/       # Alembic migration files
 │   │   ├── gateway/
-│   │   │   ├── cache.py            # Semantic cache (pgvector)
-│   │   │   ├── critic.py           # Critic runner
-│   │   │   ├── proxy.py            # LLM API calls (Anthropic + Groq)
-│   │   │   ├── router.py           # Tier → model routing
-│   │   │   └── streaming.py        # SSE streaming (PREMIUM only)
+│   │   │   ├── cache.py          # Semantic cache (pgvector)
+│   │   │   ├── proxy.py          # Anthropic + Groq API calls
+│   │   │   ├── router.py         # Tier → model + strategy routing
+│   │   │   └── streaming.py      # SSE token streaming
 │   │   ├── orchestrator/
-│   │   │   └── pipeline.py         # Tiered inference pipeline
+│   │   │   ├── pipeline.py       # AgentPipeline — runs the full agent chain
+│   │   │   └── state.py          # Task state management (DB read/write)
 │   │   ├── services/
-│   │   │   └── token_tracker.py    # Token usage + cost tracking
-│   │   ├── utils/
-│   │   │   ├── exceptions.py       # Custom exceptions
-│   │   │   └── logger.py           # Logging
-│   │   ├── config.py               # Pydantic settings
-│   │   └── main.py                 # FastAPI app
-│   ├── alembic.ini                 # Alembic config
+│   │   │   ├── embeddings.py     # Jina AI embedding calls
+│   │   │   ├── event_emitter.py  # Push SSE events to Redis
+│   │   │   ├── rate_limiter.py   # Redis-backed rate limiting
+│   │   │   └── token_tracker.py  # Log token usage + cost to DB
+│   │   ├── config.py             # Pydantic settings (reads from .env)
+│   │   └── main.py               # FastAPI app + CORS + router registration
+│   ├── tests/
+│   ├── alembic.ini
 │   ├── requirements.txt
 │   ├── Dockerfile
+│   ├── .env
 │   └── .env.example
-├── docker-compose.yml
+├── frontend/
+│   ├── app/
+│   │   ├── page.tsx              # Home — task input + live terminal + results
+│   │   ├── dashboard/page.tsx    # Stats, charts, task history
+│   │   └── results/[id]/page.tsx # Single task result view
+│   ├── components/               # All UI components
+│   ├── lib/
+│   │   ├── api.ts                # API client (fetch + SSE)
+│   │   └── utils.ts              # cn() helper
+│   └── types/index.ts            # Shared TypeScript types
 ├── scripts/
-│   └── init-db.sql                 # Enable pgvector on startup
+│   └── init-db.sql               # Enable pgvector (local dev only)
+├── docker-compose.yml
 └── README.md
 ```
 
@@ -91,238 +162,289 @@ pitchiq/
 
 ## Getting Started
 
-### 1. Prerequisites
+### Prerequisites
 
-- Docker + Docker Compose
-- Python 3.11+ (for local development)
-- API keys:
-  - [Anthropic API key](https://console.anthropic.com/)
-  - [Groq API key](https://console.groq.com/)
+- [Docker](https://www.docker.com/) — for the backend
+- [Node.js 18+](https://nodejs.org/) — for the frontend
+- API keys (all free tiers work):
+  - [Groq](https://console.groq.com/) — required
+  - [Tavily](https://tavily.com/) — required (web search)
+  - [Jina AI](https://jina.ai/) — required (embeddings / semantic cache)
+  - [Anthropic](https://console.anthropic.com/) — optional (premium model)
+- [Supabase](https://supabase.com/) project — free tier is fine
+- [Upstash](https://upstash.com/) Redis database — free tier is fine
 
-### 2. Clone and Configure
+---
+
+### 1. Clone
 
 ```bash
 git clone <repo-url>
 cd pitchiq
-
-# Copy environment template
-cp .env.example .env
-
-# Edit .env and add your API keys
-nano .env
 ```
-
-Your `.env` should look like:
-
-```env
-ANTHROPIC_API_KEY=sk-ant-...
-GROQ_API_KEY=gsk_...
-JINA_API_KEY=jina_...
-DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/pitchiq
-REDIS_URL=redis://localhost:6379
-EMBEDDING_MODEL=jina-embeddings-v3
-```
-
-### 3. Start Docker Services
-
-```bash
-# Start PostgreSQL (with pgvector) + Redis
-docker-compose up -d postgres redis
-
-# Wait for health checks to pass
-docker-compose ps
-```
-
-### 4. Run Database Migrations
-
-```bash
-cd backend
-
-# Install dependencies (if running locally)
-pip install -r requirements.txt
-
-# Run Alembic migrations
-alembic upgrade head
-```
-
-This creates:
-- `prompt_cache` table with pgvector embedding column (384-dim)
-- `token_usage` table for cost tracking
-- `users` and `tasks` tables (stubs for future auth)
-
-### 5. Start the Backend
-
-**Option A: Docker (recommended)**
-
-```bash
-docker-compose up backend
-```
-
-**Option B: Local (for development)**
-
-```bash
-cd backend
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-```
-
-The API will be available at `http://localhost:8000`.
 
 ---
 
-## API Usage
+### 2. Set up Supabase
 
-### Endpoint: `POST /api/v1/chat`
+1. Create a new project at [supabase.com](https://supabase.com)
+2. Go to **Database → Extensions** and enable **vector**
+3. Open the **SQL Editor** and run the following to create all tables:
 
-**Request body:**
+```sql
+-- Enable pgvector
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- Users
+CREATE TABLE IF NOT EXISTS users (
+    id            TEXT PRIMARY KEY,
+    email         TEXT UNIQUE,
+    password_hash TEXT,
+    created_at    TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Semantic cache
+CREATE TABLE IF NOT EXISTS prompt_cache (
+    id            TEXT PRIMARY KEY,
+    prompt_text   TEXT NOT NULL,
+    embedding     vector(1024) NOT NULL,
+    response_text TEXT NOT NULL,
+    model_used    TEXT NOT NULL,
+    quality_score FLOAT DEFAULT 0.0,
+    created_at    TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS prompt_cache_embedding_idx
+ON prompt_cache USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+
+-- Token usage
+CREATE TABLE IF NOT EXISTS token_usage (
+    id                 TEXT PRIMARY KEY,
+    user_id            TEXT,
+    model_used         TEXT NOT NULL,
+    input_tokens       INTEGER DEFAULT 0,
+    output_tokens      INTEGER DEFAULT 0,
+    estimated_cost_usd FLOAT DEFAULT 0.0,
+    task_id            TEXT,
+    created_at         TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Tasks (legacy)
+CREATE TABLE IF NOT EXISTS tasks (
+    id           TEXT PRIMARY KEY,
+    user_id      TEXT REFERENCES users(id),
+    status       TEXT DEFAULT 'pending',
+    input_data   JSONB,
+    output_data  JSONB,
+    created_at   TIMESTAMPTZ DEFAULT NOW(),
+    completed_at TIMESTAMPTZ
+);
+
+-- Agent tasks (main table)
+CREATE TABLE IF NOT EXISTS agent_tasks (
+    id             TEXT PRIMARY KEY,
+    user_id        TEXT,
+    original_task  TEXT NOT NULL,
+    user_tier      TEXT NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'pending',
+    plan           JSONB,
+    agent_outputs  JSONB DEFAULT '{}',
+    final_output   JSONB,
+    total_cost_usd FLOAT DEFAULT 0.0,
+    total_tokens   INTEGER DEFAULT 0,
+    error_message  TEXT,
+    created_at     TIMESTAMPTZ DEFAULT NOW(),
+    updated_at     TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS agent_tasks_status_idx
+ON agent_tasks (status, created_at DESC);
+
+-- Alembic version marker
+CREATE TABLE IF NOT EXISTS alembic_version (version_num TEXT PRIMARY KEY);
+INSERT INTO alembic_version (version_num) VALUES ('0002') ON CONFLICT DO NOTHING;
+```
+
+4. Go to **Project Settings → Database** and copy the **Transaction pooler** connection string (port `6543`).
+
+---
+
+### 3. Set up Upstash Redis
+
+1. Create a database at [upstash.com](https://upstash.com)
+2. From the **Connect** tab, copy the `rediss://` URL.
+
+---
+
+### 4. Configure environment
+
+```bash
+cp backend/.env.example backend/.env
+```
+
+Edit `backend/.env`:
+
+```env
+# Supabase — Transaction pooler URL (port 6543)
+DATABASE_URL=postgresql+asyncpg://postgres.[ref]:[password]@aws-0-[region].pooler.supabase.com:6543/postgres?ssl=require
+
+# Upstash Redis — TLS URL
+REDIS_URL=rediss://default:[password]@[endpoint].upstash.io:6379
+
+# LLM
+GROQ_API_KEY=gsk_...
+ANTHROPIC_API_KEY=sk-ant-...   # optional
+
+# Search + embeddings
+TAVILY_API_KEY=tvly-...
+JINA_API_KEY=jina_...
+```
+
+---
+
+### 5. Start the backend
+
+```bash
+docker compose up --build
+```
+
+The API will be available at `http://localhost:8000`.  
+Interactive docs: `http://localhost:8000/docs`
+
+---
+
+### 6. Start the frontend
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+The UI will be available at `http://localhost:3000`.
+
+---
+
+## API Reference
+
+### Start a task
+
+```
+POST /api/v1/task
+```
 
 ```json
 {
-  "prompt": "Write a cold email to a SaaS founder about our AI sales tool",
-  "messages": [
-    {"role": "user", "content": "Write a cold email to a SaaS founder about our AI sales tool"}
-  ],
-  "stream": false,
+  "task": "Find 3 YC startups solving logistics in India and write cold emails to their founders",
   "user_tier": "free"
 }
 ```
 
-**Response (FREE tier):**
+Returns immediately with a `task_id`. Connect to the SSE stream right after.
 
 ```json
 {
-  "response": "Subject: Boost Your Sales with AI...",
-  "model_used": "llama-3.1-8b-instant",
-  "quality_score": 7.2,
-  "iterations": 1,
-  "cached": false,
-  "estimated_cost_usd": 0.00012,
-  "note": "Upgrade to Premium for iterative refinement"
+  "task_id": "a1b2c3d4-...",
+  "status": "pending",
+  "message": "Task started. Connect to SSE stream for live updates."
 }
 ```
 
-**Response (PREMIUM tier):**
-
-```json
-{
-  "response": "Subject: Transform Your Sales Pipeline...",
-  "model_used": "claude-sonnet-4-20250514",
-  "quality_score": 9.1,
-  "iterations": 3,
-  "cached": false,
-  "estimated_cost_usd": 0.0234,
-  "note": null
-}
-```
-
-### Example cURL
-
-```bash
-curl -X POST http://localhost:8000/api/v1/chat \
-  -H "Content-Type: application/json" \
-  -d '{
-    "prompt": "Write a cold email to a SaaS founder",
-    "user_tier": "premium"
-  }'
-```
-
-### Streaming (PREMIUM only)
-
-```bash
-curl -X POST http://localhost:8000/api/v1/chat \
-  -H "Content-Type: application/json" \
-  -d '{
-    "prompt": "Write a cold email",
-    "user_tier": "premium",
-    "stream": true
-  }'
-```
-
-Yields SSE chunks:
+### Stream live events
 
 ```
-data: Subject: Transform
-data:  Your Sales
-data:  Pipeline...
+GET /api/v1/task/{task_id}/stream
+```
+
+Server-Sent Events. Each event is a JSON object:
+
+```
+data: {"type": "task_started",    "message": "Task received. Analyzing..."}
+data: {"type": "plan_ready",      "agents": ["researcher","enricher","writer"]}
+data: {"type": "agent_started",   "agent": "researcher", "message": "..."}
+data: {"type": "agent_log",       "agent": "researcher", "message": "Found: Delhivery — Series D"}
+data: {"type": "agent_completed", "agent": "researcher", "latency_ms": 4200, "cost_usd": 0.0}
+data: {"type": "task_completed",  "total_cost_usd": 0.0003, "critic_score": 8.1}
 data: [DONE]
 ```
 
----
+### Get final result
 
-## Cost Tracking
+```
+GET /api/v1/task/{task_id}
+```
 
-Every LLM call (including critic calls) is logged to the `token_usage` table:
+Returns the full `final_output` including all generated emails, critic score, cost, and execution time.
 
-| Column | Description |
-|--------|-------------|
-| `model_used` | e.g. `llama-3.1-8b-instant` or `claude-sonnet-4-20250514` |
-| `input_tokens` | Prompt tokens |
-| `output_tokens` | Completion tokens |
-| `estimated_cost_usd` | Calculated cost based on pricing |
+### Dashboard
 
-**Pricing (per 1M tokens):**
-
-| Model | Input | Output |
-|-------|-------|--------|
-| `llama-3.1-8b-instant` | $0.05 | $0.08 |
-| `claude-sonnet-4-20250514` | $3.00 | $15.00 |
+```
+GET /api/v1/dashboard/stats          # aggregate stats
+GET /api/v1/dashboard/tasks          # last 20 tasks
+GET /api/v1/dashboard/tasks/{id}/breakdown  # per-agent token/cost breakdown
+```
 
 ---
 
 ## Semantic Cache
 
-- **Table:** `prompt_cache`
-- **Embedding model:** `jina-embeddings-v3` via Jina AI API (1024-dim, multilingual, 8K context)
-- **Tasks:** `retrieval.query` for lookups, `retrieval.passage` for storing
-- **Similarity threshold:** 0.92 (cosine)
-- **Index:** IVFFlat for fast approximate nearest-neighbour search
+Identical or near-identical prompts (cosine similarity ≥ 0.92) return a cached response instantly — zero LLM cost.
 
-On cache hit, the LLM call is skipped entirely → zero cost.
+- **Embedding model:** `jina-embeddings-v3` via Jina AI API (1024-dim, no local GPU needed)
+- **Storage:** `prompt_cache` table in Supabase with a pgvector IVFFlat index
+- **Task type:** `text-matching` (symmetric — same text maps to same vector space)
+- **Cache hit:** skips LLM call entirely, returns stored response + score
 
 ---
 
-## Error Handling
+## Cost Tracking
 
-- **Groq call fails** → fallback to Claude Sonnet (both tiers)
-- **Critic returns invalid JSON** → default score to 5.0, feedback to "Could not evaluate"
-- **Cache read fails** → log warning, continue without cache (don't crash)
-- **Max iterations hit (PREMIUM)** → return best response so far with note: "Max iterations reached"
-- **All LLM errors** → HTTP 503 with message
+Every LLM call is logged to `token_usage` in Supabase.
+
+| Model | Input (per 1M tokens) | Output (per 1M tokens) |
+|-------|-----------------------|------------------------|
+| `llama-3.1-8b-instant` | $0.05 | $0.08 |
+| `claude-sonnet-4-20250514` | $3.00 | $15.00 |
+
+A typical free-tier task (3 companies, all agents) costs **~$0.0003**.
 
 ---
 
 ## Development
 
-### Run Tests
+### Run tests
 
 ```bash
-cd backend
-pytest
+docker compose run --rm backend pytest
 ```
 
-### Create a New Migration
+### View backend logs
 
 ```bash
-cd backend
-alembic revision -m "add new column"
-# Edit the generated file in app/db/migrations/versions/
-alembic upgrade head
+docker compose logs -f backend
 ```
 
-### View Logs
+### Add a new migration
 
-```bash
-docker-compose logs -f backend
-```
+If you change the DB schema, add a migration file in `backend/app/db/migrations/versions/` following the existing pattern, then run the SQL manually in Supabase's SQL editor.
 
 ---
 
-## What's NOT Built Yet
+## Environment Variables
 
-- JWT auth (user_tier comes from request body for now)
-- Kafka or background jobs
-- Kubernetes deployment
-- Frontend UI
-- Full multi-agent system (planner, researcher, enricher, writer)
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `DATABASE_URL` | ✅ | Supabase Transaction pooler URL (`postgresql+asyncpg://...?ssl=require`) |
+| `REDIS_URL` | ✅ | Upstash Redis TLS URL (`rediss://...`) |
+| `GROQ_API_KEY` | ✅ | Groq API key — main LLM for all agents |
+| `TAVILY_API_KEY` | ✅ | Tavily web search — researcher + enricher |
+| `JINA_API_KEY` | ✅ | Jina AI embeddings — semantic cache |
+| `ANTHROPIC_API_KEY` | ⬜ | Anthropic — only needed if `PREMIUM_MODEL=claude-sonnet-4-20250514` |
+| `SECRET_KEY` | ⬜ | JWT secret — for future auth |
+| `CORS_ORIGINS` | ⬜ | Allowed origins (default: localhost:3000) |
+| `CACHE_ENABLED` | ⬜ | Set to `false` to disable semantic cache (default: `true`) |
+| `MAX_CRITIC_ITERATIONS` | ⬜ | Max premium refinement loops (default: `3`) |
+| `PREMIUM_QUALITY_THRESHOLD` | ⬜ | Score to exit early (default: `7.5`) |
 
 ---
 
