@@ -78,7 +78,32 @@ async def run_inference(
     model = decision["model"]
     strategy = decision["strategy"]
 
-    # ── 1. Semantic cache check ──────────────────────────────────────────────
+    # ── agent_direct: skip cache + critic entirely ───────────────────────────
+    # Used by planner, researcher, enricher, critic agents — not writer.
+    # Saves ~15s per call (no critic round trip, no Jina embed round trips).
+    if strategy == "agent_direct":
+        try:
+            llm_response = await call_llm(model=model, messages=messages)
+        except Exception as exc:
+            logger.warning("agent_direct: %s failed (%s), falling back to %s", model, exc, _FALLBACK_MODEL)
+            llm_response = await call_llm(model=_FALLBACK_MODEL, messages=messages)
+        await record_usage(
+            model_used=llm_response.model,
+            input_tokens=llm_response.input_tokens,
+            output_tokens=llm_response.output_tokens,
+            db=db, user_id=user_id, task_id=task_id,
+        )
+        return PipelineResult(
+            response=llm_response.text,
+            model_used=llm_response.model,
+            quality_score=0.0,
+            iterations=1,
+            cached=False,
+            estimated_cost_usd=0.0,  # tracked in token_usage
+            note=None,
+        )
+
+    # ── 1. Semantic cache check (only for free/premium user-facing calls) ────
     cached_result = await semantic_cache.cache_get(prompt, db)
     if cached_result:
         return PipelineResult(
@@ -400,7 +425,7 @@ class AgentPipeline:
                 context = await self.state.get_context(task_id, db)
                 context["_task_id"] = task_id  # inject for live log emission
 
-                agent_tier = user_tier if agent_name == "writer" else "free"
+                agent_tier = user_tier if agent_name == "writer" else "agent"
 
                 logger.info("[pipeline] Running agent: %s (tier=%s)", agent_name, agent_tier)
                 emit_agent_started(task_id, agent_name, f"{agent_name.capitalize()} starting...")

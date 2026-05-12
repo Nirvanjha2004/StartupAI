@@ -42,7 +42,7 @@ class ResearcherAgent(BaseAgent):
     """Searches the web and summarizes findings into structured company data."""
 
     def __init__(self, tier: str = "free"):
-        super().__init__(name="researcher", role="research", tier="free")
+        super().__init__(name="researcher", role="research", tier="agent")
         self._tavily = None
 
     def _get_tavily(self):

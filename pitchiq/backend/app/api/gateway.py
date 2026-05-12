@@ -39,9 +39,9 @@ class ChatRequest(BaseModel):
         description="Conversation history in OpenAI format",
     )
     stream: bool = Field(False, description="Enable SSE streaming (PREMIUM only)")
-    user_tier: Literal["free", "premium"] = Field(
+    user_tier: Literal["free", "premium", "agent"] = Field(
         "free",
-        description="User tier — hardcoded for now, auth comes later",
+        description="User tier — 'agent' is internal, skips critic+cache",
     )
 
 

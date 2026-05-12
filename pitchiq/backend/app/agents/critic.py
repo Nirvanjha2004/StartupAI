@@ -125,7 +125,7 @@ class CriticAgent(BaseAgent):
     """
 
     def __init__(self, tier: str = "free"):
-        super().__init__(name="critic", role="evaluation", tier="free")
+        super().__init__(name="critic", role="evaluation", tier="agent")
 
     async def execute(self, task: str, context: Dict[str, Any]) -> Dict[str, Any]:
         """

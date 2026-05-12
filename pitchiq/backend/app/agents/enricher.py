@@ -37,7 +37,7 @@ class EnricherAgent(BaseAgent):
     """Finds decision maker names and contact info for companies — batched."""
 
     def __init__(self, tier: str = "free"):
-        super().__init__(name="enricher", role="enrichment", tier="free")
+        super().__init__(name="enricher", role="enrichment", tier="agent")
         self._tavily = None
 
     def _get_tavily(self):

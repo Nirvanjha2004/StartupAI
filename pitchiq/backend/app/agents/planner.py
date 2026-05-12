@@ -51,8 +51,8 @@ class PlannerAgent(BaseAgent):
     """Analyzes user task and produces structured agent execution plan."""
 
     def __init__(self, tier: str = "free"):
-        # Planner always uses free tier — structured JSON, no quality iteration needed
-        super().__init__(name="planner", role="orchestration", tier="free")
+        # Planner uses "agent" tier — direct LLM call, no critic, no cache
+        super().__init__(name="planner", role="orchestration", tier="agent")
 
     async def execute(self, task: str, context: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -72,11 +72,8 @@ class PlannerAgent(BaseAgent):
         gw = await self._call_gateway(
             prompt=task,
             messages=messages,
-            # Use free tier (single-pass) — planner needs one structured JSON
-            # response, not iterative refinement.
-            # Disable cache for planner — every task needs a fresh plan.
-            tier_override="free",
-            skip_cache=True,
+            tier_override="agent",   # direct call — no critic, no cache
+            skip_cache=True,         # planner always needs fresh plan
         )
 
         plan = self._parse_plan(gw.response, task)
